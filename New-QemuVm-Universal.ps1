@@ -1,42 +1,24 @@
 <#
 .SYNOPSIS
-    New-GpuVm.ps1 (v3) - all-in-one builder for GPU-accelerated Omarchy/Ubuntu
-    QEMU VMs on a Windows x86_64 host (WHPX). Safe-exit design.
+    New-GpuVm.ps1 v3.2 - GPU-accelerated Omarchy/Ubuntu QEMU VM builder for
+    Windows x86_64 hosts (WHPX), with a safe-exit design.
 
 .DESCRIPTION
-    Phases: inputs -> QEMU health -> host sizing -> distro -> accelerator ->
-    GPU -> firmware -> disk/port -> launcher. Every external fact is probed,
-    never assumed:
-
-      - QEMU binary runs (catches broken/missing-DLL installs)
-      - version parsed; device/display/audio backends parsed from help output
-      - WHPX probe launch (2nd chance with kernel-irqchip=off = documented
-        wedge workaround); optional DISM enable + reboot flow if feature off
-      - GPU device realize probe (3D flags actually initialize)
-      - ssh port auto-picks the next free one; disk free space checked
-      - HypervisorPresent / RDP session / OneDrive / hybrid-CPU diagnostics
-
-    Safe-exit guarantees:
-      - hard failures exit instantly with a distinct exit code (see below)
-      - ambiguous states pause and ask; -Unattended resolves them to the
-        SAFE default (usually abort) instead of guessing
-      - never overwrites a disk or NVRAM; launchers are backed up (.bak-*)
-      - full decision log in <VmDir>\setup-log.txt
-      - probe processes are always cleaned up (finally block)
+    Probes every external fact (QEMU build, WHPX, GPU device, firmware,
+    ports) before acting; never overwrites disks or NVRAM; backs up
+    launchers before regenerating them; logs every decision to
+    <VmDir>\setup-log.txt; exits with a distinct code on failure.
 
     Generated launcher: <distro>-launch.ps1 (+ double-clickable .cmd shim)
       -BootInstaller   boot the ISO (first install / rescue)
       -FullScreen      start fullscreen (Ctrl+Alt+F toggles any time)
-
-    Requires Windows PowerShell 5.1+ (works on PS 7). No admin needed except
-    when enabling the Hypervisor Platform feature.
 
 .PARAMETER IsoPath          Path to the Omarchy or Ubuntu .iso (asked if omitted)
 .PARAMETER VmDir            Target directory (asked if omitted, created if missing)
 .PARAMETER Vcpus            vCPU count (default 8)
 .PARAMETER RamGB            Guest RAM in GB (default 8)
 .PARAMETER DiskGB           Sparse qcow2 size in GB (default 60)
-.PARAMETER ExpectedSha256   Optional: fail unless the ISO SHA256 matches (input error)
+.PARAMETER ExpectedSha256   Optional: fail unless the ISO SHA256 matches
 .PARAMETER Unattended       Never prompt; decisions resolve to the safe default
 .PARAMETER SkipProbes       Skip WHPX/GPU launch probes (assume from help output)
 .PARAMETER NoPause          Do not pause before closing on error
@@ -46,8 +28,6 @@
     .\New-GpuVm.ps1 -Verbose
 .EXAMPLE
     .\New-GpuVm.ps1 -IsoPath D:\isos\omarchy.iso -VmDir D:\vms\omarchy -LaunchNow
-.EXAMPLE
-    .\New-GpuVm.ps1 -IsoPath ubuntu-24.04.iso -VmDir D:\vms\u -ExpectedSha256 ABCD... -Unattended
 
 .NOTES
     Exit codes:
@@ -56,7 +36,10 @@
       2  aborted at a prompt / reboot-required state reached
       3  virtualization / accelerator failure
       4  input or validation failure (ISO, paths, hash)
-      5  tooling failure (qemu-img, OVMF firmware)
+      5  tooling failure (qemu-img, OVMF firmware, launcher generation)
+
+    Requires Windows PowerShell 5.1+ (works on PS 7). Admin needed only to
+    enable the Hypervisor Platform feature.
 #>
 [CmdletBinding()]
 param(
@@ -76,6 +59,7 @@ param(
 $script:exitCode = 0
 $script:Warns = 0
 $script:vmDir = $null
+$script:qemuExe = $null
 $script:LogPath = $null
 $script:LogBuf = New-Object System.Collections.Generic.List[string]
 $script:ProbePids = New-Object System.Collections.Generic.List[int]
@@ -120,7 +104,7 @@ function Confirm-OrAbort {
 function Get-NativeOutput {
     param([string]$FilePath, [string[]]$ArgumentList)
     $prev = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-    try { (& $FilePath @ArgumentList 2>&1 | ForEach-Object { $_.ToString() }) -join "`n" }
+    try { (& $FilePath @ArgumentList 2>&1 | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine }
     finally { $ErrorActionPreference = $prev }
 }
 function Invoke-Native {
@@ -139,12 +123,19 @@ function Test-Admin {
 # not at first VM boot. Success = process still alive after N seconds.
 function Test-QemuLaunch {
     param([string[]]$QemuArgs, [string]$Tag, [int]$Seconds = 4)
-    $errFile = Join-Path $script:vmDir ("probe-{0}.err" -f ($Tag -replace '[^a-zA-Z0-9_-]', '_'))
-    $argList = @('-name', "probe-$Tag", '-machine', 'q35', '-nodefaults',
-        '-display', 'none', '-monitor', 'none', '-S') + $QemuArgs
+    $safeTag = ($Tag -replace '[^a-zA-Z0-9_-]', '_')
+    $errFile = Join-Path $script:vmDir ("probe-{0}.err" -f $safeTag)
+    $argList = @('-name', "probe-$safeTag", '-machine', 'q35', '-nodefaults', '-display', 'none', '-monitor', 'none', '-S') + $QemuArgs
     $p = $null; $ok = $false; $detail = ''
     try {
-        $p = Start-Process -FilePath $script:qemuExe -ArgumentList $argList -NoNewWindow -PassThru -RedirectStandardError $errFile
+        $sp = @{
+            FilePath              = $script:qemuExe
+            ArgumentList          = $argList
+            NoNewWindow           = $true
+            PassThru              = $true
+            RedirectStandardError = $errFile
+        }
+        $p = Start-Process @sp
         $script:ProbePids.Add($p.Id) | Out-Null
         Start-Sleep -Seconds $Seconds
         $ok = -not $p.HasExited
@@ -177,8 +168,8 @@ function Save-FirmwareFile {
 
 # ============================================================== MAIN
 try {
-    Write-Host '=== New-GpuVm v3 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
-    Log 'Setup started.'
+    Write-Host '=== New-GpuVm v3.2 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
+    Log 'Setup started (New-GpuVm v3.2).'
 
     # ---------------------------------------------------- [1/9] inputs
     if (-not $IsoPath) { $IsoPath = Read-Host 'Path to the Omarchy/Ubuntu ISO' }
@@ -221,7 +212,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $verOut) {
         Fail 'INPUT' ("QEMU at '{0}' failed to run (exit {1}). Usual cause: the exe was copied out of its folder without its DLLs - reinstall or fix PATH." -f $script:qemuExe, $LASTEXITCODE)
     }
-    $verLine = ($verOut -split "`n")[0]
+    $verLine = ($verOut -split [Environment]::NewLine)[0]
     $qVer = [version]'0.0'
     if ($verLine -match 'version\s+(\d+)\.(\d+)(?:\.(\d+))?') {
         $patch = if ($Matches[3]) { $Matches[3] } else { '0' }
@@ -233,17 +224,17 @@ try {
     # which virtio display devices does this binary actually ship?
     $devHelp = Get-NativeOutput $script:qemuExe @('-device', 'help')
     $needsVgaNone = $false    # non-VGA virtio variants do NOT suppress default VGA (dual-display trap)
-    if ($devHelp -match 'virtio-vga-gl') { $gpuDev = 'virtio-vga-gl'; $gpuKind = 'gl'; }
+    if ($devHelp -match 'virtio-vga-gl') { $gpuDev = 'virtio-vga-gl'; $gpuKind = 'gl' }
     elseif ($devHelp -match 'virtio-gpu-gl') { $gpuDev = 'virtio-gpu-gl'; $gpuKind = 'gl'; $needsVgaNone = $true }
-    elseif ($devHelp -match 'virtio-vga') { $gpuDev = 'virtio-vga'; $gpuKind = '2d'; }
+    elseif ($devHelp -match 'virtio-vga') { $gpuDev = 'virtio-vga'; $gpuKind = '2d' }
     elseif ($devHelp -match 'virtio-gpu') { $gpuDev = 'virtio-gpu'; $gpuKind = '2d'; $needsVgaNone = $true }
     else { $gpuDev = 'VGA'; $gpuKind = 'none' }
     Log "GPU device detection: $gpuDev (kind=$gpuKind, vga-none=$needsVgaNone)"
 
     # display backend must exist, or the launcher would fail on every boot
     $dispHelp = Get-NativeOutput $script:qemuExe @('-display', 'help')
-    if ($dispHelp -match '(?m)^\s*sdl\b') { $display = 'sdl,gl=on' }
-    elseif ($dispHelp -match '(?m)^\s*gtk\b') { $display = 'gtk,gl=on,show-cursor=on' }
+    if ($dispHelp -match '\bsdl\b') { $display = 'sdl,gl=on' }
+    elseif ($dispHelp -match '\bgtk\b') { $display = 'gtk,gl=on,show-cursor=on' }
     else {
         Confirm-OrAbort 'No SDL/GTK display backend in this build - the VM would be HEADLESS (no window).'
         $display = 'none'; Warn 'Display=none: 3D will not be visible even if the GPU device initializes.'
@@ -305,12 +296,15 @@ try {
                 if ($a -eq 'y') {
                     if (-not (Test-Admin)) { Fail 'ENV' 'Enabling Hypervisor Platform requires an elevated (Run as Administrator) PowerShell.' }
                     $d = Start-Process dism.exe -ArgumentList '/online', '/Enable-Feature', '/FeatureName:HypervisorPlatform', '/All', '/NoRestart' -Wait -PassThru
-                    if ($d.ExitCode -ne 0) { Fail 'ENV' "DISM failed (exit $($d.ExitCode)). Enable manually: optionalfeatures.exe -> Windows Hypervisor Platform." }
+                    # 0 = success, 3010 = success + reboot required
+                    if ($d.ExitCode -ne 0 -and $d.ExitCode -ne 3010) {
+                        Fail 'ENV' "DISM failed (exit $($d.ExitCode)). Enable manually: optionalfeatures.exe -> Windows Hypervisor Platform."
+                    }
                     Fail 'ABORT' 'Windows Hypervisor Platform enabled. REBOOT now, then re-run this script.'
                 }
             }
             elseif (-not $featState -and -not $hypPresent) {
-                Write-Warning 'Hyper-V hypervisor not running and feature state unknown. If the probe fails: enable "Windows Hypervisor Platform" (optionalfeatures.exe) + firmware virtualization, reboot.'
+                Warn 'Hyper-V hypervisor not running and feature state unknown. If the probe fails: enable "Windows Hypervisor Platform" (optionalfeatures.exe) + firmware virtualization, reboot.'
             }
         }
         if ($SkipProbes) {
@@ -363,8 +357,7 @@ try {
 
     # ---------------------------------------------------- [7/9] firmware (OVMF)
     $code = $null; $varsTpl = $null
-    $fwDirs = @($qemuDir, (Join-Path $qemuDir 'share'), (Join-Path $qemuDir 'share\qemu'),
-        (Join-Path $qemuDir 'pc-bios'), (Join-Path $qemuDir '..\share\qemu'))
+    $fwDirs = @($qemuDir, (Join-Path $qemuDir 'share'), (Join-Path $qemuDir 'share\qemu'), (Join-Path $qemuDir 'pc-bios'), (Join-Path $qemuDir '..\share\qemu'))
     foreach ($d in $fwDirs) { if (-not $code) { $c = Join-Path $d 'edk2-x86_64-code.fd'; if (Test-Path $c) { $code = $c } } }
     foreach ($d in $fwDirs) { if (-not $varsTpl) { $v = Join-Path $d 'edk2-i386-vars.fd'; if (Test-Path $v) { $varsTpl = $v } } }
     if (-not $code) {
@@ -425,7 +418,7 @@ try {
     }
 
     $launcher = @'
-# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3 on @DATE@.
+# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3.2 on @DATE@.
 # Re-running setup regenerates this file (previous copy saved as .bak-*).
 # Usage: .\@DISTRO@-launch.ps1 [-BootInstaller] [-FullScreen]
 #   -BootInstaller  boot the ISO (first install, or rescue/reinstall later)
@@ -478,21 +471,35 @@ if ($FullScreen) { $a += '-full-screen' }
 & $qemu @a
 exit $LASTEXITCODE
 '@
-    $launcher = $launcher.Replace('@DATE@', (Get-Date -Format 'yyyy-MM-dd HH:mm')) `
-        .Replace('@QEMU@', $script:qemuExe).Replace('@DISTRO@', $distro) `
-        .Replace('@ACCEL@', $accel).Replace('@CPU@', $cpuModel) `
-        .Replace('@SMP@', "$Vcpus,sockets=1,cores=$Vcpus,threads=1").Replace('@VCPUS@', "$Vcpus") `
-        .Replace('@RAM@', "$RamGB").Replace('@CODE@', $code).Replace('@VARS@', $vars) `
-        .Replace('@GPU@', $gpuArg).Replace('@DISPLAY@', $display) `
-        .Replace('@VGANONE@', $(if ($needsVgaNone) { "    '-vga','none'," } else { '' })) `
-        .Replace('@DISK@', $disk).Replace('@PORT@', "$port").Replace('@ISO@', $IsoPath) `
-        .Replace('@HAVEAUDIO@', $(if ($audioOK) { '$true' } else { '$false' }))
+
+    # Token substitution: table-driven, no line-continuations to break on paste
+    $tokens = [ordered]@{
+        '@DATE@'      = (Get-Date -Format 'yyyy-MM-dd HH:mm')
+        '@QEMU@'      = $script:qemuExe
+        '@DISTRO@'    = $distro
+        '@ACCEL@'     = $accel
+        '@CPU@'       = $cpuModel
+        '@SMP@'       = "$Vcpus,sockets=1,cores=$Vcpus,threads=1"
+        '@VCPUS@'     = "$Vcpus"
+        '@RAM@'       = "$RamGB"
+        '@CODE@'      = $code
+        '@VARS@'      = $vars
+        '@GPU@'       = $gpuArg
+        '@DISPLAY@'   = $display
+        '@VGANONE@'   = $(if ($needsVgaNone) { "    '-vga','none'," } else { '' })
+        '@DISK@'      = $disk
+        '@PORT@'      = "$port"
+        '@ISO@'       = $IsoPath
+        '@HAVEAUDIO@' = $(if ($audioOK) { '$true' } else { '$false' })
+    }
+    foreach ($t in $tokens.Keys) { $launcher = $launcher.Replace([string]$t, [string]$tokens[$t]) }
 
     try { $null = [scriptblock]::Create($launcher) }   # syntax-check WITHOUT running
     catch { Fail 'TOOL' "Internal error: generated launcher failed to parse: $($_.Exception.Message)" }
 
     Set-Content -LiteralPath $launchPs1 -Value $launcher -Encoding UTF8
-    Set-Content -LiteralPath $launchCmd -Value ("@echo off`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0${distro}-launch.ps1`" %*`r`n") -Encoding ASCII
+    $cmdBody = '@echo off' + [Environment]::NewLine + 'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0' + $distro + '-launch.ps1" %*' + [Environment]::NewLine
+    Set-Content -LiteralPath $launchCmd -Value $cmdBody -Encoding ASCII
     Log "Launcher written: $launchPs1 (accel=$accel gpu=$gpuArg display=$display port=$port audio=$audioOK)"
 
     # ---------------------------------------------------- summary
@@ -546,3 +553,4 @@ finally {
     }
 }
 exit $script:exitCode
+# --- EOF: New-GpuVm.ps1 v3.2 ---
