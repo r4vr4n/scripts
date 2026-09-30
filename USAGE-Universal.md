@@ -173,6 +173,7 @@ All parameters are optional; the script asks for ISO path and VM directory inter
 | `-WinqEmuDir` | string, `C:\WINQ-EMU` | Where the virgl-capable WINQ-EMU build is reused from, or installed to (after asking) if missing. |
 | `-UsePathQemu` | switch | Don't use or install WINQ-EMU; use `qemu-system-x86_64.exe` from PATH (pre-v3.3 behavior). |
 | `-Fresh` | switch | Start over. Lists and deletes this distro's `.qcow2` disk(s), `-VARS.fd`, launchers (+ `.bak-*`) and stale `probe-*.err` in `VmDir`, then rebuilds. Offers to hard-stop the VM if it's running. `setup-log.txt` is kept. Use while iterating; **never after you've installed something you want to keep.** |
+| `-SkipProfileCommand` | switch | Don't offer to add a `<distro>` launch command (e.g. `ubuntu`) to your PowerShell 5.1/7 profiles. By default the script asks (default yes) just before launching the installer. The name becomes `<distro>-vm` if `<distro>` is already a program (e.g. WSL's `ubuntu.exe`). The block is managed between `# >>> New-GpuVm` markers and refreshed on every run. |
 | `-Firmware` | `Auto` (default) / `Bios` / `Uefi` | `Auto` picks BIOS for a new or empty disk, because WINQ-EMU says EFI slows Venus/Vulkan init. It picks UEFI only when the disk already holds data **and** `<distro>-VARS.fd` exists, so a VM installed under UEFI keeps booting. |
 | `-Verbose` | switch (common) | Streams every decision as it's made; also written to `setup-log.txt` regardless. |
 
@@ -428,6 +429,15 @@ WINQ-EMU (see credits in the try-omarchy-windows README) or Tsuki-Bakery/qemu-vi
 
 **Why no copy/paste between host and guest?**
 Clipboard integration comes via SPICE, which Windows QEMU builds don't ship. Use SSH/SCP (§10).
+
+**Can I move the VM to another Windows PC?**
+Yes:
+
+1. Shut the guest down from inside.
+2. Copy `<distro>.qcow2` and the ISO (the script requires an ISO path). Don't copy `<distro>-VARS.fd` for a BIOS VM.
+3. On the new PC, enable Windows Hypervisor Platform, then run the script with the new `-VmDir`, without `-Fresh`, and answer **r** (reuse). It installs WINQ-EMU and regenerates the launcher and profile command.
+
+Optional: shrink the file for transfer with `qemu-img convert -O qcow2 -c <distro>.qcow2 small.qcow2`.
 
 **Can I move the VM folder?**
 Same path: yes. Different path/drive: re-run the script — it regenerates the launcher (absolute paths) and reuses disk + NVRAM.

@@ -32,6 +32,8 @@
                             UEFI NVRAM is present
 .PARAMETER Fresh            Start over: delete this distro's disk(s), NVRAM and launchers in
                             VmDir (after listing them) and rebuild. setup-log.txt is kept
+.PARAMETER SkipProfileCommand  Don't offer to add a '<distro>' launch command to the
+                            PowerShell 5.1/7 profiles (asked by default; never in -Unattended)
 
 .EXAMPLE
     .\New-GpuVm.ps1 -Verbose
@@ -65,7 +67,8 @@ param(
     [string]$WinqEmuDir = 'C:\WINQ-EMU',
     [switch]$UsePathQemu,
     [ValidateSet('Auto', 'Bios', 'Uefi')][string]$Firmware = 'Auto',
-    [switch]$Fresh
+    [switch]$Fresh,
+    [switch]$SkipProfileCommand
 )
 
 # ------------------------------------------------------------- state & helpers
@@ -178,6 +181,45 @@ function Save-FirmwareFile {
         Fail 'TOOL' ("Firmware download failed: {0}. Manual fix: place the file at '{1}' and re-run." -f $_.Exception.Message, $Dest)
     }
     finally { $ProgressPreference = $prev }
+}
+
+# Adds/refreshes a managed "function <Name> { & '<launcher>' @args }" block in the
+# user's PowerShell profiles (5.1 always; 7 if installed). Idempotent: the block
+# between the markers is replaced on every run, so a moved VM gets the new path.
+function Add-ProfileCommand {
+    param([string]$Name, [string]$Launcher, [string]$Tag)
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    $profiles = @(Join-Path $docs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1')
+    if ((Get-Command pwsh -ErrorAction SilentlyContinue) -or (Test-Path "$env:ProgramFiles\PowerShell\7\pwsh.exe") -or (Test-Path (Join-Path $docs 'PowerShell'))) {
+        $profiles += Join-Path $docs 'PowerShell\Microsoft.PowerShell_profile.ps1'
+    }
+    $begin = "# >>> New-GpuVm: $Tag >>>"; $end = "# <<< New-GpuVm: $Tag <<<"
+    $block = @($begin, "# generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') - usage: $Name [-FullScreen] [-SafeGraphics] [-BootInstaller]",
+        "function $Name { & '$($Launcher.Replace("'", "''"))' @args }", $end) -join "`r`n"
+    $written = @()
+    foreach ($p in $profiles) {
+        try {
+            $dir = Split-Path -Parent $p
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            $text = if (Test-Path $p) { [IO.File]::ReadAllText($p) } else { '' }
+            $rx = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
+            $m = [regex]::Match($text, $rx)
+            if ($m.Success) { $text = $text.Remove($m.Index, $m.Length).Insert($m.Index, $block) }
+            else { $text = $text.TrimEnd() + $(if ($text.Trim()) { "`r`n`r`n" } else { '' }) + $block + "`r`n" }
+            [IO.File]::WriteAllText($p, $text, (New-Object Text.UTF8Encoding $true))   # BOM: PS 5.1 reads BOM-less UTF-8 as ANSI
+            $written += $p; Log "Profile command '$Name' written to $p"
+        }
+        catch { Warn "Could not update profile '$p': $($_.Exception.Message)" }
+    }
+    # a profile only loads if the (non-process) execution policy allows scripts
+    $eff = 'Restricted'
+    foreach ($s in 'MachinePolicy', 'UserPolicy', 'CurrentUser', 'LocalMachine') {
+        $v = Get-ExecutionPolicy -Scope $s; if ($v -ne 'Undefined') { $eff = "$v"; break }
+    }
+    if ($eff -in 'Restricted', 'AllSigned') {
+        Warn "Execution policy is '$eff', so profiles will not load and '$Name' won't exist. Fix once: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
+    }
+    return $written
 }
 
 function Find-QemuUnder {
@@ -647,6 +689,16 @@ exit $LASTEXITCODE
     Set-Content -LiteralPath $launchCmd -Value $cmdBody -Encoding ASCII
     Log "Launcher written: $launchPs1 (accel=$accel firmware=$fw gpu=$gpuArg display=$display port=$port audio=$(if ($audioOK) { $audioName } else { 'none' }))"
 
+    # terminal shortcut: "<distro>" (or "<distro>-vm" if that name is taken, e.g. WSL's ubuntu.exe)
+    $profCmd = $null
+    if (-not $SkipProfileCommand) {
+        $profCmd = $distro
+        if (Get-Command $profCmd -CommandType Application, ExternalScript -ErrorAction SilentlyContinue) { $profCmd = "$distro-vm" }
+        $a = Ask "Add a '$profCmd' command to your PowerShell profile to launch this VM?" 'y', 'n' 'y' 'n'
+        if ($a -eq 'y') { if (-not (Add-ProfileCommand -Name $profCmd -Launcher $launchPs1 -Tag $distro)) { $profCmd = $null } }
+        else { $profCmd = $null; Log 'Profile command skipped by user.' }
+    }
+
     # ---------------------------------------------------- summary
     Write-Host ''
     Write-Host '================= VM ready =================' -ForegroundColor Green
@@ -658,6 +710,7 @@ exit $LASTEXITCODE
     Write-Host " Audio       : $(if ($audioOK) { "dsound -> $audioName" } else { 'none (backend missing)' })"
     Write-Host " Disk        : $disk"
     Write-Host " Launcher    : $launchPs1  (or ${distro}-launch.cmd)"
+    if ($profCmd) { Write-Host " Command     : $profCmd   (new terminals; this one: . `$PROFILE)" }
     Write-Host " Guest ssh   : ssh -p $port <user>@localhost"
     Write-Host " Log         : $script:LogPath   (warnings: $script:Warns)"
     Write-Host '--------------------------------------------'

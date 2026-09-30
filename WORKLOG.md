@@ -209,3 +209,23 @@ Still open:
 - A copied qcow2 alone (no launcher, no VARS.fd) resolves to **bios**.
 
 **Move recipe:** copy only `ubuntu.qcow2` (9.4 GB used) and the ISO. Do **not** copy `ubuntu-VARS.fd`. On the new PC, run the setup script without `-Fresh` and answer **r** (reuse).
+
+### 14. Terminal launch command added by the script
+
+**Request:** have the script add the launch command to the user's terminal profile before the installation starts.
+
+**Implementation (`Add-ProfileCommand`):**
+- **When:** after the launcher is written and before "Launch now?". The script asks first (default y; `-Unattended` answers n; `-SkipProfileCommand` skips the question).
+- **Where:** it always writes the Windows PowerShell 5.1 profile. It also writes the PowerShell 7 profile if pwsh is installed or `Documents\PowerShell` exists.
+- **Managed block:** `# >>> New-GpuVm: <distro> >>>` … `<<<`. The block is **replaced** on every run, so a moved VM gets the new path. The rest of the profile is left untouched.
+- **Name:** `<distro>`, or `<distro>-vm` if that name is already an executable (for example WSL's `ubuntu.exe`).
+- **Encoding:** UTF-8 with BOM, so PS 5.1 reads it correctly.
+- **Execution policy:** warns if the policy (ignoring the Process scope) is Restricted or AllSigned, because the profile would then not load.
+
+**Tested against temp profiles:**
+- ✅ Running twice leaves exactly one block, with the path updated.
+- ✅ Existing oh-my-posh and manual `function ubuntu` lines are preserved. The managed block comes last, so it wins.
+- ✅ A path with a space and a `'` is escaped correctly.
+- ✅ The resulting profiles parse.
+
+**Docs:** USAGE §4 now covers `-SkipProfileCommand`, and a FAQ entry covers moving the VM to another Windows PC.
