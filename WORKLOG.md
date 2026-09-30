@@ -184,3 +184,14 @@ No script change until the cause is known.
 - ✅ It leaves `TryOmarchy\` and `setup-log.txt` alone.
 - ✅ The running VM (PID 50704) is matched by its disk path, so the stop prompt will appear.
 - ⏳ The user re-runs with `-Fresh`, then does the install in 2D.
+
+### 12. Result: success ✅
+
+The user ran it with `-Fresh`. The first attempt worked end to end: the cleanup, the rebuild, and the 2D (`-SafeGraphics`) install all went through with no issues.
+
+**Working recipe (v3.5):** WINQ-EMU alpha10 (QEMU 11.0), WHPX, BIOS boot, `virtio-vga-gl,hostmem=4G,blob=true,venus=true`, `sdl,gl=on`, virtio-sound, and the install done in 2D.
+
+Still open:
+- Boot the installed desktop in 3D (`E:\Vms\ubuntu-launch.ps1`).
+- Check `glxinfo -B` (virgl) and `vulkaninfo --summary` (Venus).
+- See whether the installed GNOME session flickers the way the live session did.
