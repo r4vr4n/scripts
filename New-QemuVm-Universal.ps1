@@ -27,8 +27,9 @@
                             there from GitHub (after asking) if missing. Default C:\WINQ-EMU
 .PARAMETER UsePathQemu      Skip WINQ-EMU and use qemu-system-x86_64.exe from PATH
 .PARAMETER Firmware         Auto (default) | Bios | Uefi. Auto = BIOS for a new/empty disk
-                            (WINQ-EMU: EFI slows Venus init), UEFI only for a disk that is
-                            already installed with UEFI NVRAM present
+                            (WINQ-EMU: EFI slows Venus init). For an installed disk it keeps
+                            what the existing launcher used; with no launcher, UEFI only if
+                            UEFI NVRAM is present
 .PARAMETER Fresh            Start over: delete this distro's disk(s), NVRAM and launchers in
                             VmDir (after listing them) and rebuild. setup-log.txt is kept
 
@@ -510,11 +511,17 @@ try {
     $vars = Join-Path $script:vmDir "${distro}-VARS.fd"
     $diskUsed = 0
     try { $diskUsed = [long]((Invoke-Native $qemuImg @('info', '-U', '--output=json', $disk) 'qemu-img info') | ConvertFrom-Json).'actual-size' } catch {}
-    $uefiInstalled = ($diskUsed -gt 1MB) -and (Test-Path $vars)
+    # an existing launcher is the ground truth for how the installed disk boots
+    # (a stale VARS.fd from an earlier UEFI attempt must not flip a BIOS install)
+    $prevLauncher = Join-Path $script:vmDir "${distro}-launch.ps1"
+    $prevFw = $null
+    if (Test-Path $prevLauncher) { $prevFw = if (Select-String -LiteralPath $prevLauncher -Pattern 'if=pflash' -Quiet) { 'uefi' } else { 'bios' } }
+    $uefiInstalled = if ($prevFw) { $prevFw -eq 'uefi' } else { ($diskUsed -gt 1MB) -and (Test-Path $vars) }
+    $uefiInstalled = $uefiInstalled -and ($diskUsed -gt 1MB)
     $fw = $Firmware.ToLower()
     if ($fw -eq 'auto') { $fw = if ($uefiInstalled) { 'uefi' } else { 'bios' } }
     elseif ($fw -eq 'bios' -and $uefiInstalled) { Warn "Disk holds data and UEFI NVRAM exists: a system installed under UEFI will NOT boot with -Firmware Bios." }
-    Log ("Firmware: {0} (requested {1}; disk actual-size {2:N0} bytes, NVRAM present: {3})" -f $fw, $Firmware, $diskUsed, (Test-Path $vars))
+    Log ("Firmware: {0} (requested {1}; disk actual-size {2:N0} bytes, NVRAM present: {3}, previous launcher: {4})" -f $fw, $Firmware, $diskUsed, (Test-Path $vars), $(if ($prevFw) { $prevFw } else { 'none' }))
 
     if ($fw -eq 'uefi') {
         $code = $null; $varsTpl = $null

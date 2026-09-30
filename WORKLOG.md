@@ -195,3 +195,17 @@ Still open:
 - Boot the installed desktop in 3D (`E:\Vms\ubuntu-launch.ps1`).
 - Check `glxinfo -B` (virgl) and `vulkaninfo --summary` (Venus).
 - See whether the installed GNOME session flickers the way the live session did.
+
+### 13. Moving the VM to another Windows PC + firmware-detection fix
+
+**Found while answering "can I move the image":**
+- `E:\Vms\ubuntu-VARS.fd` is a leftover from the first UEFI attempt (19:52). The same disk was later reused and installed under **BIOS**.
+- `-Firmware Auto` treated "disk has data + VARS.fd present" as a UEFI install. So any later re-run would have switched this VM to UEFI and it would no longer boot.
+
+**Fix:** for an installed disk, `Auto` now uses the existing launcher as ground truth (`if=pflash` in it means UEFI, otherwise BIOS). Only when there's no launcher does it fall back to the VARS.fd check.
+
+**Simulated:**
+- This VM resolves to **bios**.
+- A copied qcow2 alone (no launcher, no VARS.fd) resolves to **bios**.
+
+**Move recipe:** copy only `ubuntu.qcow2` (9.4 GB used) and the ISO. Do **not** copy `ubuntu-VARS.fd`. On the new PC, run the setup script without `-Fresh` and answer **r** (reuse).
