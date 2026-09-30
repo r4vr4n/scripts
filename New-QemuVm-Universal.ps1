@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    New-GpuVm.ps1 v3.3 - GPU-accelerated Omarchy/Ubuntu QEMU VM builder for
+    New-GpuVm.ps1 v3.4 - GPU-accelerated Omarchy/Ubuntu QEMU VM builder for
     Windows x86_64 hosts (WHPX), with a safe-exit design.
 
 .DESCRIPTION
@@ -26,6 +26,9 @@
 .PARAMETER WinqEmuDir       Where the virgl-capable WINQ-EMU build lives; installed
                             there from GitHub (after asking) if missing. Default C:\WINQ-EMU
 .PARAMETER UsePathQemu      Skip WINQ-EMU and use qemu-system-x86_64.exe from PATH
+.PARAMETER Firmware         Auto (default) | Bios | Uefi. Auto = BIOS for a new/empty disk
+                            (WINQ-EMU: EFI slows Venus init), UEFI only for a disk that is
+                            already installed with UEFI NVRAM present
 
 .EXAMPLE
     .\New-GpuVm.ps1 -Verbose
@@ -57,7 +60,8 @@ param(
     [switch]$NoPause,
     [switch]$LaunchNow,
     [string]$WinqEmuDir = 'C:\WINQ-EMU',
-    [switch]$UsePathQemu
+    [switch]$UsePathQemu,
+    [ValidateSet('Auto', 'Bios', 'Uefi')][string]$Firmware = 'Auto'
 )
 
 # ------------------------------------------------------------- state & helpers
@@ -226,8 +230,8 @@ function Install-WinqEmu {
 
 # ============================================================== MAIN
 try {
-    Write-Host '=== New-GpuVm v3.3 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
-    Log 'Setup started (New-GpuVm v3.3).'
+    Write-Host '=== New-GpuVm v3.4 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
+    Log 'Setup started (New-GpuVm v3.4).'
 
     # ---------------------------------------------------- [1/9] inputs
     if (-not $IsoPath) { $IsoPath = Read-Host 'Path to the Omarchy/Ubuntu ISO' }
@@ -265,8 +269,10 @@ try {
         $qemuCmd = Get-Command qemu-system-x86_64.exe -ErrorAction SilentlyContinue
         if (-not $qemuCmd) { Fail 'INPUT' 'qemu-system-x86_64.exe is not on PATH. Install QEMU or add its bin folder to PATH.' }
         $script:qemuExe = $qemuCmd.Source
+        $isWinq = $false
     }
     else {
+        $isWinq = $true
         # virgl-capable build: reuse an existing WINQ-EMU install, install only if missing
         $script:qemuExe = Find-QemuUnder $WinqEmuDir
         if ($script:qemuExe) { Log "WINQ-EMU found: $script:qemuExe (reused)" }
@@ -302,6 +308,9 @@ try {
     elseif ($devHelp -match 'virtio-gpu') { $gpuDev = 'virtio-gpu'; $gpuKind = '2d'; $needsVgaNone = $true }
     else { $gpuDev = 'VGA'; $gpuKind = 'none' }
     Log "GPU device detection: $gpuDev (kind=$gpuKind, vga-none=$needsVgaNone)"
+    $safeGpu = if ($devHelp -match 'virtio-vga') { 'virtio-vga' } else { 'VGA' }   # launcher -SafeGraphics
+    $vsound = $devHelp -match 'virtio-sound-pci'   # WINQ-EMU's tested audio path
+    $audioName = if ($vsound) { 'virtio-sound' } else { 'ICH9 HDA' }
 
     # display backend must exist, or the launcher would fail on every boot
     $dispHelp = Get-NativeOutput $script:qemuExe @('-display', 'help')
@@ -406,7 +415,8 @@ try {
     if ($gpuKind -eq 'gl') {
         $hostmemGB = [math]::Max(1, [math]::Min(4, [int][math]::Floor($RamGB / 2)))
         $gpuArg = '{0},hostmem={1}G,blob=true' -f $gpuDev, $hostmemGB
-        if ($isOma -and $qVer -ge [version]'9.2.0') { $gpuArg += ',venus=true' }   # Hyprland: Vulkan via Venus
+        # Vulkan via Venus: Hyprland needs it; WINQ-EMU's tested config enables it for every guest
+        if (($isOma -or $isWinq) -and $qVer -ge [version]'9.2.0') { $gpuArg += ',venus=true' }
     }
     else {
         $gpuArg = $gpuDev
@@ -415,6 +425,11 @@ try {
         $probeDisplay = if ($gpuKind -eq 'gl') { $display } else { 'none' }
         Write-Host 'Probing GPU device init (~4 s; a blank VM window may flash)...'
         $r = Test-QemuLaunch -QemuArgs @('-accel', $accel, '-device', $gpuArg) -Tag 'gpu' -Display $probeDisplay
+        if (-not $r.OK -and $gpuArg -like '*,venus=true') {   # second chance: GL without Vulkan forwarding
+            Warn "GPU '$gpuArg' failed to initialize ($($r.Detail)); retrying without venus."
+            $gpuArg = $gpuArg -replace ',venus=true$', ''
+            $r = Test-QemuLaunch -QemuArgs @('-accel', $accel, '-device', $gpuArg) -Tag 'gpu-novenus' -Display $probeDisplay
+        }
         if (-not $r.OK) {
             Warn "GPU '$gpuArg' failed to initialize: $($r.Detail)"
             $alt = if ($devHelp -match 'virtio-vga') { 'virtio-vga' } elseif ($devHelp -match 'virtio-gpu') { 'virtio-gpu' } else { 'VGA' }
@@ -428,28 +443,7 @@ try {
         Confirm-OrAbort ('No working VirGL 3D path detected - the guest will SOFTWARE-render (llvmpipe). Better: install a virgl-capable Windows QEMU build (WINQ-EMU / qemu-virgl-whpx) and re-run.')
     }
 
-    # ---------------------------------------------------- [7/9] firmware (OVMF)
-    $code = $null; $varsTpl = $null
-    $fwDirs = @($qemuDir, (Join-Path $qemuDir 'share'), (Join-Path $qemuDir 'share\qemu'), (Join-Path $qemuDir 'pc-bios'), (Join-Path $qemuDir '..\share\qemu'))
-    foreach ($d in $fwDirs) { if (-not $code) { $c = Join-Path $d 'edk2-x86_64-code.fd'; if (Test-Path $c) { $code = $c } } }
-    foreach ($d in $fwDirs) { if (-not $varsTpl) { $v = Join-Path $d 'edk2-i386-vars.fd'; if (Test-Path $v) { $varsTpl = $v } } }
-    if (-not $code) {
-        Write-Warning 'OVMF code image not found next to QEMU - downloading (qemu v9.2.0).'
-        $code = Join-Path $script:vmDir 'edk2-x86_64-code.fd'
-        Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-x86_64-code.fd' $code 1MB
-    }
-    if (-not $varsTpl) {
-        Write-Warning 'OVMF vars template not found - downloading.'
-        $varsTpl = Join-Path $script:vmDir 'edk2-i386-vars.fd'
-        Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-i386-vars.fd' $varsTpl 100KB
-    }
-    Log "Firmware: code=$code vars-template=$varsTpl"
-
-    $vars = Join-Path $script:vmDir "${distro}-VARS.fd"
-    if (Test-Path $vars) { Log 'NVRAM preserved (idempotent re-run).' }
-    else { Copy-Item $varsTpl $vars; Log 'NVRAM created from template.' }
-
-    # ---------------------------------------------------- [8/9] disk + port
+    # ---------------------------------------------------- [7/9] disk + port
     $qemuImg = Join-Path $qemuDir 'qemu-img.exe'
     if (-not (Test-Path $qemuImg)) {
         $qi = Get-Command qemu-img.exe -ErrorAction SilentlyContinue
@@ -481,6 +475,44 @@ try {
     }
     if ($tries -ge 25) { Fail 'ENV' 'No free ssh port found in 2222-2246.' }
 
+    # ---------------------------------------------------- [8/9] firmware
+    # BIOS unless a UEFI install must be preserved: switching an installed UEFI disk
+    # to BIOS leaves it unbootable. -U: read even if a running VM holds the lock.
+    $vars = Join-Path $script:vmDir "${distro}-VARS.fd"
+    $diskUsed = 0
+    try { $diskUsed = [long]((Invoke-Native $qemuImg @('info', '-U', '--output=json', $disk) 'qemu-img info') | ConvertFrom-Json).'actual-size' } catch {}
+    $uefiInstalled = ($diskUsed -gt 1MB) -and (Test-Path $vars)
+    $fw = $Firmware.ToLower()
+    if ($fw -eq 'auto') { $fw = if ($uefiInstalled) { 'uefi' } else { 'bios' } }
+    elseif ($fw -eq 'bios' -and $uefiInstalled) { Warn "Disk holds data and UEFI NVRAM exists: a system installed under UEFI will NOT boot with -Firmware Bios." }
+    Log ("Firmware: {0} (requested {1}; disk actual-size {2:N0} bytes, NVRAM present: {3})" -f $fw, $Firmware, $diskUsed, (Test-Path $vars))
+
+    if ($fw -eq 'uefi') {
+        $code = $null; $varsTpl = $null
+        $fwDirs = @($qemuDir, (Join-Path $qemuDir 'share'), (Join-Path $qemuDir 'share\qemu'), (Join-Path $qemuDir 'pc-bios'), (Join-Path $qemuDir '..\share\qemu'))
+        foreach ($d in $fwDirs) { if (-not $code) { $c = Join-Path $d 'edk2-x86_64-code.fd'; if (Test-Path $c) { $code = $c } } }
+        foreach ($d in $fwDirs) { if (-not $varsTpl) { $v = Join-Path $d 'edk2-i386-vars.fd'; if (Test-Path $v) { $varsTpl = $v } } }
+        if (-not $code) {
+            Write-Warning 'OVMF code image not found next to QEMU - downloading (qemu v9.2.0).'
+            $code = Join-Path $script:vmDir 'edk2-x86_64-code.fd'
+            Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-x86_64-code.fd' $code 1MB
+        }
+        if (-not $varsTpl) {
+            Write-Warning 'OVMF vars template not found - downloading.'
+            $varsTpl = Join-Path $script:vmDir 'edk2-i386-vars.fd'
+            Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-i386-vars.fd' $varsTpl 100KB
+        }
+        Log "OVMF: code=$code vars-template=$varsTpl"
+        if (Test-Path $vars) { Log 'NVRAM preserved (idempotent re-run).' }
+        else { Copy-Item $varsTpl $vars; Log 'NVRAM created from template.' }
+        $fwLines = "    # UEFI/OVMF: read-only firmware code + writable per-VM NVRAM`r`n" +
+                   "    '-drive','if=pflash,format=raw,readonly=on,file=$code',`r`n" +
+                   "    '-drive','if=pflash,format=raw,file=$vars',"
+    }
+    else {
+        $fwLines = "    # BIOS (SeaBIOS, QEMU default) - WINQ-EMU: EFI boot slows Venus/Vulkan init"
+    }
+
     # ---------------------------------------------------- [9/9] launcher
     $launchPs1 = Join-Path $script:vmDir "${distro}-launch.ps1"
     $launchCmd = Join-Path $script:vmDir "${distro}-launch.cmd"
@@ -491,19 +523,23 @@ try {
     }
 
     $launcher = @'
-# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3.3 on @DATE@.
+# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3.4 on @DATE@.
 # Re-running setup regenerates this file (previous copy saved as .bak-*).
-# Usage: .\@DISTRO@-launch.ps1 [-BootInstaller] [-FullScreen]
+# Usage: .\@DISTRO@-launch.ps1 [-BootInstaller] [-FullScreen] [-SafeGraphics]
 #   -BootInstaller  boot the ISO (first install, or rescue/reinstall later)
 #   -FullScreen     start fullscreen; Ctrl+Alt+F toggles any time
+#   -SafeGraphics   plain 2D (no virgl/Venus): use if the desktop glitches or 3D breaks
 # After first install, run WITHOUT -BootInstaller.
 # Verify 3D inside the guest:  glxinfo -B   -> renderer must be virgl (NOT llvmpipe).
 param(
     [switch]$BootInstaller,
-    [switch]$FullScreen
+    [switch]$FullScreen,
+    [switch]$SafeGraphics
 )
  $ErrorActionPreference = 'Stop'
- $hdBoot = if ($BootInstaller) { 1 } else { 0 }   # OVMF boots by bootindex, not -boot order
+ $hdBoot = if ($BootInstaller) { 1 } else { 0 }   # firmware boots by bootindex, not -boot order
+ $gpu = '@GPU@'; $disp = '@DISPLAY@'
+ if ($SafeGraphics) { $gpu = '@SAFEGPU@'; $disp = $disp -replace 'gl=on', 'gl=off' }
 
  $qemu = '@QEMU@'
  $a = @(
@@ -514,16 +550,14 @@ param(
     '-smp','@SMP@',                                          # @VCPUS@ vCPUs, 1 socket
     '-m','@RAM@G',                                           # guest RAM
     '-nodefaults',                                           # nothing implicit: every device below is deliberate
-    # UEFI/OVMF: read-only firmware code + writable per-VM NVRAM
-    '-drive','if=pflash,format=raw,readonly=on,file=@CODE@',
-    '-drive','if=pflash,format=raw,file=@VARS@',
+@FIRMWARE@
     # GPU: virtio-*-gl = paravirt GPU with VirGL 3D (host GL via ANGLE on Windows builds)
     #      blob+hostmem = required for GL4.6/Venus; venus=true adds Vulkan forwarding
-    '-device','@GPU@',
+    '-device',$gpu,
 @VGANONE@
     # SDL window with a host OpenGL context; gl=on is REQUIRED for virgl; vsync'd presentation
-    '-display','@DISPLAY@',
-    # system disk on virtio-blk; bootindex decides UEFI boot order
+    '-display',$disp,
+    # system disk on virtio-blk; bootindex decides boot order
     '-drive','file=@DISK@,if=none,id=hd,format=qcow2',
     '-device',"virtio-blk-pci,drive=hd,bootindex=$hdBoot",
     # input: xHCI + tablet (seamless pointer) + keyboard; rng avoids boot-time entropy stalls
@@ -533,8 +567,8 @@ param(
     '-netdev','user,id=n0,hostfwd=tcp:127.0.0.1:@PORT@-:22',
     '-rtc','base=utc'                                        # correct clock for Linux guests
 )
-if (@HAVEAUDIO@) {   # audio: DirectSound backend -> ICH9 HDA (PipeWire auto-detects in guest)
-    $a += @('-audiodev','dsound,id=ao','-device','ich9-intel-hda','-device','hda-duplex,audiodev=ao')
+if (@HAVEAUDIO@) {   # audio: DirectSound backend -> @AUDIONAME@ (PipeWire auto-detects in guest)
+    $a += @('-audiodev','dsound,id=ao',@AUDIODEV@)
 }
 if ($BootInstaller) {   # installer ISO with top boot priority while installing
     $a += @('-drive','file=@ISO@,if=none,id=cd,readonly=on','-device','ide-cd,drive=cd,bootindex=0')
@@ -555,9 +589,11 @@ exit $LASTEXITCODE
         '@SMP@'       = "$Vcpus,sockets=1,cores=$Vcpus,threads=1"
         '@VCPUS@'     = "$Vcpus"
         '@RAM@'       = "$RamGB"
-        '@CODE@'      = $code
-        '@VARS@'      = $vars
+        '@FIRMWARE@'  = $fwLines
         '@GPU@'       = $gpuArg
+        '@SAFEGPU@'   = $safeGpu
+        '@AUDIODEV@'  = $(if ($vsound) { "'-device','virtio-sound-pci,audiodev=ao'" } else { "'-device','ich9-intel-hda','-device','hda-duplex,audiodev=ao'" })
+        '@AUDIONAME@' = $audioName
         '@DISPLAY@'   = $display
         '@VGANONE@'   = $(if ($needsVgaNone) { "    '-vga','none'," } else { '' })
         '@DISK@'      = $disk
@@ -573,22 +609,23 @@ exit $LASTEXITCODE
     Set-Content -LiteralPath $launchPs1 -Value $launcher -Encoding UTF8
     $cmdBody = '@echo off' + [Environment]::NewLine + 'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0' + $distro + '-launch.ps1" %*' + [Environment]::NewLine
     Set-Content -LiteralPath $launchCmd -Value $cmdBody -Encoding ASCII
-    Log "Launcher written: $launchPs1 (accel=$accel gpu=$gpuArg display=$display port=$port audio=$audioOK)"
+    Log "Launcher written: $launchPs1 (accel=$accel firmware=$fw gpu=$gpuArg display=$display port=$port audio=$(if ($audioOK) { $audioName } else { 'none' }))"
 
     # ---------------------------------------------------- summary
     Write-Host ''
     Write-Host '================= VM ready =================' -ForegroundColor Green
     Write-Host " Distro      : $distro"
     Write-Host " Accelerator : $accel"
+    Write-Host " Firmware    : $fw"
     Write-Host " GPU device  : $gpuArg"
     Write-Host " Display     : $display"
-    Write-Host " Audio       : $(if ($audioOK) { 'dsound -> ICH9 HDA' } else { 'none (backend missing)' })"
+    Write-Host " Audio       : $(if ($audioOK) { "dsound -> $audioName" } else { 'none (backend missing)' })"
     Write-Host " Disk        : $disk"
     Write-Host " Launcher    : $launchPs1  (or ${distro}-launch.cmd)"
     Write-Host " Guest ssh   : ssh -p $port <user>@localhost"
     Write-Host " Log         : $script:LogPath   (warnings: $script:Warns)"
     Write-Host '--------------------------------------------'
-    Write-Host ' 1. Run with -BootInstaller to install to disk'
+    Write-Host ' 1. Run with -BootInstaller to install to disk (add -SafeGraphics if the UI glitches)'
     Write-Host ' 2. In guest: glxinfo -B  -> renderer must be virgl, NOT llvmpipe'
     if ($isOma) { Write-Host ' 3. Hyprland mode: monitor = Virtual-1,1920x1080@144,0x0,1  (judge with a vsync test)' }
     else { Write-Host ' 3. GNOME may cap at 60 Hz; verify with a browser vsync test on the physical console' }
@@ -626,4 +663,4 @@ finally {
     }
 }
 exit $script:exitCode
-# --- EOF: New-GpuVm.ps1 v3.3 ---
+# --- EOF: New-GpuVm.ps1 v3.4 ---

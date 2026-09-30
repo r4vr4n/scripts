@@ -172,6 +172,7 @@ All parameters are optional; the script asks for ISO path and VM directory inter
 | `-LaunchNow` | switch | Boot the installer immediately after setup succeeds. |
 | `-WinqEmuDir` | string, `C:\WINQ-EMU` | Where the virgl-capable WINQ-EMU build is reused from, or installed to (after asking) if missing. |
 | `-UsePathQemu` | switch | Don't use or install WINQ-EMU; use `qemu-system-x86_64.exe` from PATH (pre-v3.3 behavior). |
+| `-Firmware` | `Auto` (default) / `Bios` / `Uefi` | `Auto` picks BIOS for a new or empty disk, because WINQ-EMU says EFI slows Venus/Vulkan init. It picks UEFI only when the disk already holds data **and** `<distro>-VARS.fd` exists, so a VM installed under UEFI keeps booting. |
 | `-Verbose` | switch (common) | Streams every decision as it's made; also written to `setup-log.txt` regardless. |
 
 Examples:
@@ -199,9 +200,9 @@ Nine phases, in order. Every ⚡ item is a live probe — a real test, not an as
 | 3. Host sizing | Logical cores, total/free RAM, free disk vs `DiskGB`, hybrid-Intel (E-core) warning, RDP-session warning |
 | 4. Distro | From ISO filename; asks you if ambiguous (fails in `-Unattended`) |
 | 5. Accelerator | `HypervisorPresent` + feature state → if feature missing: offers to enable via DISM (admin; then exit 2 → reboot → re-run) → ⚡ live WHPX launch probe (paused VM, 4 s); on failure, one second chance with `kernel-irqchip=off` (the documented wedge workaround) → TCG only if you explicitly accept |
-| 6. GPU | Builds the device string: `hostmem` = min(4, RamGB/2) GB, `blob=true`, `venus=true` for Omarchy on QEMU ≥ 9.2 → ⚡ live device-realize probe (proves the 3D device initializes, not just that it's compiled in); on failure downgrades to 2D with your consent |
-| 7. Firmware | Finds OVMF (`edk2-x86_64-code.fd` + vars template) next to QEMU; downloads from the qemu v9.2.0 tag (TLS 1.2, size-checked) if absent → creates per-VM NVRAM copy, preserves existing |
-| 8. Disk + port | ⚡ `qemu-img` found → never overwrites: existing disk → reuse/new/abort → picks the first free ssh port from 2222 (Omarchy) / 2223 (Ubuntu) |
+| 6. GPU | Builds the device string: `hostmem` = min(4, RamGB/2) GB, `blob=true`, `venus=true` for Omarchy or WINQ-EMU on QEMU ≥ 9.2 → ⚡ live device-realize probe with the real `gl=on` display (proves the 3D device initializes, not just that it's compiled in); retries once without `venus`, then downgrades to 2D with your consent |
+| 7. Disk + port | ⚡ `qemu-img` found → never overwrites: existing disk → reuse/new/abort → picks the first free ssh port from 2222 (Omarchy) / 2223 (Ubuntu) |
+| 8. Firmware | `-Firmware Auto`: BIOS for a new/empty disk, UEFI for an installed disk with NVRAM. UEFI only: finds OVMF (`edk2-x86_64-code.fd` + vars template) next to QEMU; downloads from the qemu v9.2.0 tag (TLS 1.2, size-checked) if absent → creates per-VM NVRAM copy, preserves existing |
 | 9. Launcher | Backs up any existing launcher (`.bak-*`) → generates `<distro>-launch.ps1` + double-clickable `.cmd` shim → syntax self-check (`[scriptblock]::Create()`) before writing |
 
 ---
@@ -276,7 +277,10 @@ The launcher has two switches:
 .\omarchy-launch.ps1 -BootInstaller    # boot the ISO (first install)
 .\omarchy-launch.ps1                   # boot the installed disk (daily use)
 .\omarchy-launch.ps1 -FullScreen       # start fullscreen (Ctrl+Alt+F toggles)
+.\omarchy-launch.ps1 -SafeGraphics     # plain 2D (virtio-vga, gl=off): no 3D, but can't glitch
 ```
+
+> **Installer UI smearing or ghosting?** Boot with `-BootInstaller -SafeGraphics`, install, then boot without `-SafeGraphics` to go back to 3D.
 
 `-BootInstaller` puts the CD first in UEFI boot order (via `bootindex` — OVMF ignores legacy `-boot order=`). After installation, run without the switch and the disk boots.
 
@@ -395,6 +399,7 @@ Behavior: WINQ-EMU is never installed unattended, so preinstall it into `-WinqEm
 | --- | --- |
 | `glxinfo -B` says llvmpipe | Host QEMU build has no virgl → install WINQ-EMU / qemu-virgl-whpx (§2.3), re-run script, verify summary shows `virtio-vga-gl,...` |
 | Launcher fails instantly at boot | Usually flags vs build mismatch → re-run the script so the launcher is regenerated against the *current* QEMU build; check `setup-log.txt` |
+| Windows leave ghost trails / smeared stacked frames | Was seen with UEFI + virgl. Re-run the script: `-Firmware Auto` picks BIOS for an empty disk and adds `venus=true` + virtio-sound (WINQ-EMU's tested config). If it still happens, install with `-SafeGraphics` |
 | No window at all | Build lacks SDL/GTK (summary would have said `Display: none`) → use a normal build |
 | Everything is slow | Summary said `Accelerator: tcg` → fix WHPX (exit-3 row above) and re-run |
 | Stuttering / bad frames over RDP | Expected — test at the physical console |

@@ -114,3 +114,33 @@ I picked WINQ-EMU: it's newer, the docs already recommend it, and it has a singl
 - ? The launcher failed at once: `'hda-dup' is not a valid device model name`. The audio codec was misspelled in the launcher template; it should be `hda-duplex` (confirmed with `-device help`). Fixed.
 - Note: the files landed in `E:\Vms\` rather than `E:\VMs\Ubuntu26`. Check which `-VmDir` was actually passed.
 
+
+### 9. Installer UI glitching (v3.4)
+
+**Symptom:** the Ubuntu 26.04 live session booted, but GNOME windows smeared. Stacked ghost copies of old frames made the installer unusable. The disk was still empty (198 KB), so nothing had been installed.
+
+**Comparison with WINQ-EMU's own tested launcher** (`C:\WINQ-EMU\launch-vm.bat` + `README.txt`):
+
+| | Ours (v3.3) | WINQ-EMU reference |
+| --- | --- | --- |
+| Firmware | UEFI (OVMF) | **BIOS**. README: "Use BIOS boot, not EFI/UEFI - EFI boot causes a timing issue with Vulkan initialization" |
+| GPU | `virtio-vga-gl,hostmem=4G,blob=true` | `virtio-vga-gl,blob=on,hostmem=4G,venus=on` |
+| Audio | ICH9 HDA + hda-duplex | `virtio-sound-pci` |
+
+**Changes (`New-QemuVm-Universal.ps1` v3.4):**
+- `-Firmware Auto|Bios|Uefi`:
+  - `Auto` picks BIOS for a new or empty disk.
+  - It picks UEFI only if the disk holds more than 1 MB of data **and** `<distro>-VARS.fd` exists. That protects VMs already installed under UEFI.
+  - Disk usage comes from `qemu-img info -U --output=json`.
+  - The disk and port phase now runs before the firmware phase.
+- `venus=true` for all distros on WINQ-EMU. If the GPU probe fails, it retries once without venus before falling back to 2D.
+- Audio uses `virtio-sound-pci` when the build has it.
+- New launcher switch `-SafeGraphics`: `virtio-vga` + `sdl,gl=off`, for finishing an install if 3D still misbehaves.
+
+**Verification (mine):**
+- ✅ Parser: 0 errors.
+- ✅ The launcher template renders and parses for both BIOS and UEFI. The BIOS variant has no pflash lines.
+- ✅ `-SafeGraphics` swaps the GPU to `virtio-vga` and the display to `sdl,gl=off`.
+- ✅ WINQ-EMU probe with `virtio-vga-gl,hostmem=4G,blob=true,venus=true` + `sdl,gl=on` + virtio-sound under WHPX: still alive after 5 s.
+- ✅ `E:\Vms\ubuntu.qcow2` actual-size is 198,144 bytes, so `Auto` resolves to **BIOS**.
+- ⏳ The user re-runs the script, then checks whether the installer draws cleanly.
