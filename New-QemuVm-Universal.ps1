@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    New-GpuVm.ps1 v3.2 - GPU-accelerated Omarchy/Ubuntu QEMU VM builder for
+    New-GpuVm.ps1 v3.3 - GPU-accelerated Omarchy/Ubuntu QEMU VM builder for
     Windows x86_64 hosts (WHPX), with a safe-exit design.
 
 .DESCRIPTION
@@ -23,6 +23,9 @@
 .PARAMETER SkipProbes       Skip WHPX/GPU launch probes (assume from help output)
 .PARAMETER NoPause          Do not pause before closing on error
 .PARAMETER LaunchNow        Boot the installer immediately after setup
+.PARAMETER WinqEmuDir       Where the virgl-capable WINQ-EMU build lives; installed
+                            there from GitHub (after asking) if missing. Default C:\WINQ-EMU
+.PARAMETER UsePathQemu      Skip WINQ-EMU and use qemu-system-x86_64.exe from PATH
 
 .EXAMPLE
     .\New-GpuVm.ps1 -Verbose
@@ -52,7 +55,9 @@ param(
     [switch]$Unattended,
     [switch]$SkipProbes,
     [switch]$NoPause,
-    [switch]$LaunchNow
+    [switch]$LaunchNow,
+    [string]$WinqEmuDir = 'C:\WINQ-EMU',
+    [switch]$UsePathQemu
 )
 
 # ------------------------------------------------------------- state & helpers
@@ -122,10 +127,11 @@ function Test-Admin {
 # paths. WHPX + device realize still run, so real failures surface HERE,
 # not at first VM boot. Success = process still alive after N seconds.
 function Test-QemuLaunch {
-    param([string[]]$QemuArgs, [string]$Tag, [int]$Seconds = 4)
+    # -Display: virtio-*-gl devices refuse to realize without a gl=on display
+    param([string[]]$QemuArgs, [string]$Tag, [int]$Seconds = 4, [string]$Display = 'none')
     $safeTag = ($Tag -replace '[^a-zA-Z0-9_-]', '_')
     $errFile = Join-Path $script:vmDir ("probe-{0}.err" -f $safeTag)
-    $argList = @('-name', "probe-$safeTag", '-machine', 'q35', '-nodefaults', '-display', 'none', '-monitor', 'none', '-S') + $QemuArgs
+    $argList = @('-name', "probe-$safeTag", '-machine', 'q35', '-nodefaults', '-display', $Display, '-monitor', 'none', '-S') + $QemuArgs
     $p = $null; $ok = $false; $detail = ''
     try {
         $sp = @{
@@ -166,10 +172,62 @@ function Save-FirmwareFile {
     finally { $ProgressPreference = $prev }
 }
 
+function Find-QemuUnder {
+    param([string]$Root)   # WINQ-EMU layout may be <root>\ or <root>\bin\
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $null }
+    Get-ChildItem -LiteralPath $Root -Filter 'qemu-system-x86_64.exe' -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
+# Downloads the latest WINQ-EMU (virgl + Venus Windows QEMU build) NSIS installer
+# from GitHub and installs it silently into $Dir. Asks first: Unattended never
+# installs third-party software on its own.
+function Install-WinqEmu {
+    param([string]$Dir)
+    $prev = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'   # 5.1 IWR progress is very slow
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072   # TLS 1.2
+        try { $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/cmspam/winq-emu/releases/latest' -UseBasicParsing -Headers @{ 'User-Agent' = 'New-GpuVm' } }
+        catch { Fail 'TOOL' ("Cannot query WINQ-EMU releases on GitHub: {0}. Install it manually from https://github.com/cmspam/winq-emu/releases into '{1}', or re-run with -UsePathQemu." -f $_.Exception.Message, $Dir) }
+        $asset = $rel.assets | Where-Object { $_.name -like '*-Setup.exe' } | Select-Object -First 1
+        if (-not $asset) { Fail 'TOOL' "WINQ-EMU release '$($rel.tag_name)' has no *-Setup.exe asset. Install manually or re-run with -UsePathQemu." }
+        Log ("WINQ-EMU latest: {0} ({1}, {2:N0} bytes)" -f $rel.tag_name, $asset.name, $asset.size)
+
+        $a = Ask ("Download and install WINQ-EMU {0} ({1:N0} MB) from github.com/cmspam/winq-emu into '{2}'?" -f $rel.tag_name, ($asset.size / 1MB), $Dir) 'y', 'n' 'y' 'n'
+        if ($a -ne 'y') { Fail 'ABORT' "WINQ-EMU not installed. Install it into '$Dir' yourself, or re-run with -UsePathQemu to use QEMU from PATH." }
+
+        $dlDir = Join-Path $env:TEMP 'winq-emu'
+        New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
+        $setup = Join-Path $dlDir $asset.name
+        if (-not (Test-Path $setup) -or (Get-Item $setup).Length -ne $asset.size) {
+            Write-Host ("Downloading {0} ({1:N0} MB)..." -f $asset.name, ($asset.size / 1MB))
+            try { Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $setup -UseBasicParsing }
+            catch { Remove-Item $setup -Force -ErrorAction SilentlyContinue; Fail 'TOOL' "WINQ-EMU download failed: $($_.Exception.Message)" }
+        }
+        $len = (Get-Item $setup).Length
+        if ($len -ne $asset.size) { Remove-Item $setup -Force; Fail 'TOOL' "WINQ-EMU download size mismatch: expected $($asset.size), got $len bytes." }
+        if ($asset.digest -match '^sha256:([0-9a-fA-F]{64})$') {
+            $want = $Matches[1].ToUpper(); $got = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
+            if ($got -ne $want) { Remove-Item $setup -Force; Fail 'TOOL' "WINQ-EMU installer SHA256 mismatch: expected $want, got $got." }
+            Log 'WINQ-EMU installer SHA256 verified against GitHub digest.'
+        }
+        else { Log 'GitHub published no SHA256 digest for the installer; size check only.' }
+        $sig = Get-AuthenticodeSignature -LiteralPath $setup
+        Log ("WINQ-EMU installer Authenticode: {0} {1}" -f $sig.Status, $(if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }))
+
+        Write-Host "Installing WINQ-EMU into $Dir (silent; accept the UAC prompt if one appears)..."
+        # NSIS: /S = silent; /D= must be LAST and unquoted
+        $p = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$Dir" -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Fail 'TOOL' "WINQ-EMU installer exited $($p.ExitCode). Run '$setup' manually, or re-run with -UsePathQemu." }
+        Log "WINQ-EMU $($rel.tag_name) installed into $Dir"
+    }
+    finally { $ProgressPreference = $prev }
+}
+
 # ============================================================== MAIN
 try {
-    Write-Host '=== New-GpuVm v3.2 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
-    Log 'Setup started (New-GpuVm v3.2).'
+    Write-Host '=== New-GpuVm v3.3 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
+    Log 'Setup started (New-GpuVm v3.3).'
 
     # ---------------------------------------------------- [1/9] inputs
     if (-not $IsoPath) { $IsoPath = Read-Host 'Path to the Omarchy/Ubuntu ISO' }
@@ -203,10 +261,24 @@ try {
     }
 
     # ---------------------------------------------------- [2/9] QEMU health
-    $qemuCmd = Get-Command qemu-system-x86_64.exe -ErrorAction SilentlyContinue
-    if (-not $qemuCmd) { Fail 'INPUT' 'qemu-system-x86_64.exe is not on PATH. Install QEMU or add its bin folder to PATH.' }
-    $script:qemuExe = $qemuCmd.Source
+    if ($UsePathQemu) {
+        $qemuCmd = Get-Command qemu-system-x86_64.exe -ErrorAction SilentlyContinue
+        if (-not $qemuCmd) { Fail 'INPUT' 'qemu-system-x86_64.exe is not on PATH. Install QEMU or add its bin folder to PATH.' }
+        $script:qemuExe = $qemuCmd.Source
+    }
+    else {
+        # virgl-capable build: reuse an existing WINQ-EMU install, install only if missing
+        $script:qemuExe = Find-QemuUnder $WinqEmuDir
+        if ($script:qemuExe) { Log "WINQ-EMU found: $script:qemuExe (reused)" }
+        else {
+            Install-WinqEmu $WinqEmuDir
+            $script:qemuExe = Find-QemuUnder $WinqEmuDir
+            if (-not $script:qemuExe) { Fail 'TOOL' "WINQ-EMU installed but qemu-system-x86_64.exe not found under '$WinqEmuDir'." }
+        }
+    }
     $qemuDir = Split-Path -Parent $script:qemuExe
+    $env:PATH = "$qemuDir;$env:PATH"   # this process only: DLLs + qemu-img resolve from the chosen build
+    Log "QEMU binary: $script:qemuExe"
 
     $verOut = Get-NativeOutput $script:qemuExe @('--version')
     if ($LASTEXITCODE -ne 0 -or -not $verOut) {
@@ -340,8 +412,9 @@ try {
         $gpuArg = $gpuDev
     }
     if ($gpuKind -ne 'none' -and -not $SkipProbes) {
-        Write-Host 'Probing GPU device init (~4 s)...'
-        $r = Test-QemuLaunch -QemuArgs @('-accel', $accel, '-device', $gpuArg) -Tag 'gpu'
+        $probeDisplay = if ($gpuKind -eq 'gl') { $display } else { 'none' }
+        Write-Host 'Probing GPU device init (~4 s; a blank VM window may flash)...'
+        $r = Test-QemuLaunch -QemuArgs @('-accel', $accel, '-device', $gpuArg) -Tag 'gpu' -Display $probeDisplay
         if (-not $r.OK) {
             Warn "GPU '$gpuArg' failed to initialize: $($r.Detail)"
             $alt = if ($devHelp -match 'virtio-vga') { 'virtio-vga' } elseif ($devHelp -match 'virtio-gpu') { 'virtio-gpu' } else { 'VGA' }
@@ -418,7 +491,7 @@ try {
     }
 
     $launcher = @'
-# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3.2 on @DATE@.
+# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3.3 on @DATE@.
 # Re-running setup regenerates this file (previous copy saved as .bak-*).
 # Usage: .\@DISTRO@-launch.ps1 [-BootInstaller] [-FullScreen]
 #   -BootInstaller  boot the ISO (first install, or rescue/reinstall later)
@@ -553,4 +626,4 @@ finally {
     }
 }
 exit $script:exitCode
-# --- EOF: New-GpuVm.ps1 v3.2 ---
+# --- EOF: New-GpuVm.ps1 v3.3 ---

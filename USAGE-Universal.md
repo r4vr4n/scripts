@@ -60,7 +60,15 @@ You don't have to do this beforehand — if it's missing, the script detects it,
 
 ### 2.3 Install QEMU — ⚠ the critical step
 
-Stock QEMU from qemu.org or MSYS2 is 2D-only on Windows. Your guest will software-render (llvmpipe) — the script will detect this and warn you, but it cannot fix it. For real 3D you need a virgl-capable Windows build on PATH:
+**Automatic (default since v3.3):** the script looks for WINQ-EMU in `-WinqEmuDir` (default `C:\WINQ-EMU`) and reuses it if it's there. If it's missing, the script asks and then:
+
+1. Downloads the latest `*-Setup.exe` from [github.com/cmspam/winq-emu/releases](https://github.com/cmspam/winq-emu/releases).
+2. Checks its size and the SHA256 digest GitHub publishes.
+3. Installs it silently (NSIS `/S`). Accept the UAC prompt if one appears.
+
+Pass `-UsePathQemu` to skip this and use whatever `qemu-system-x86_64.exe` is on PATH (the manual route below).
+
+**Manual:** stock QEMU from qemu.org or MSYS2 is 2D-only on Windows. Your guest will software-render (llvmpipe) — the script will detect this and warn you, but it cannot fix it. For real 3D you need a virgl-capable Windows build on PATH:
 
 | BUILD | WHAT YOU GET |
 | --- | --- |
@@ -162,6 +170,8 @@ All parameters are optional; the script asks for ISO path and VM directory inter
 | `-SkipProbes` | switch | Skip the live WHPX/GPU launch probes and assume from help output. Only if probes hang on exotic hardware. |
 | `-NoPause` | switch | Don't pause for Enter on error (for scripted runs). |
 | `-LaunchNow` | switch | Boot the installer immediately after setup succeeds. |
+| `-WinqEmuDir` | string, `C:\WINQ-EMU` | Where the virgl-capable WINQ-EMU build is reused from, or installed to (after asking) if missing. |
+| `-UsePathQemu` | switch | Don't use or install WINQ-EMU; use `qemu-system-x86_64.exe` from PATH (pre-v3.3 behavior). |
 | `-Verbose` | switch (common) | Streams every decision as it's made; also written to `setup-log.txt` regardless. |
 
 Examples:
@@ -185,7 +195,7 @@ Nine phases, in order. Every ⚡ item is a live probe — a real test, not an as
 | PHASE | WHAT IT CHECKS / DOES |
 | --- | --- |
 | 1. Inputs | ARM64 host guard → ISO exists/sane size/.iso extension → VM dir created, writability probed → OneDrive warnings → optional SHA256 verification |
-| 2. QEMU health | ⚡ Binary actually runs (catches missing-DLL installs) → version parsed → ⚡ `-device help` parsed: picks the best GPU device (`virtio-vga-gl` > `virtio-gpu-gl` > `virtio-vga` > `virtio-gpu` > `VGA`) → ⚡ `-display help`: SDL preferred, GTK fallback → ⚡ `-audiodev help`: `dsound` present? |
+| 2. QEMU health | WINQ-EMU in `-WinqEmuDir` reused, or downloaded + verified + installed after asking (`-UsePathQemu`: PATH instead) → ⚡ Binary actually runs (catches missing-DLL installs) → version parsed → ⚡ `-device help` parsed: picks the best GPU device (`virtio-vga-gl` > `virtio-gpu-gl` > `virtio-vga` > `virtio-gpu` > `VGA`) → ⚡ `-display help`: SDL preferred, GTK fallback → ⚡ `-audiodev help`: `dsound` present? |
 | 3. Host sizing | Logical cores, total/free RAM, free disk vs `DiskGB`, hybrid-Intel (E-core) warning, RDP-session warning |
 | 4. Distro | From ISO filename; asks you if ambiguous (fails in `-Unattended`) |
 | 5. Accelerator | `HypervisorPresent` + feature state → if feature missing: offers to enable via DISM (admin; then exit 2 → reboot → re-run) → ⚡ live WHPX launch probe (paused VM, 4 s); on failure, one second chance with `kernel-irqchip=off` (the documented wedge workaround) → TCG only if you explicitly accept |
@@ -359,7 +369,7 @@ For scripting/CI — no prompts, safe defaults, machine-readable exit code:
 if ($LASTEXITCODE -ne 0) { throw "VM setup failed with $LASTEXITCODE" }
 ```
 
-Behavior: ambiguous ISO names fail (4) instead of guessing; degraded paths (TCG, 2D, headless) abort (2) instead of proceeding; the final "launch now?" is skipped unless `-LaunchNow`.
+Behavior: WINQ-EMU is never installed unattended, so preinstall it into `-WinqEmuDir` or pass `-UsePathQemu` (otherwise it exits 2); ambiguous ISO names fail (4) instead of guessing; degraded paths (TCG, 2D, headless) abort (2) instead of proceeding; the final "launch now?" is skipped unless `-LaunchNow`.
 
 `-SkipProbes` exists for hosts where the paused-VM probes misbehave; the script then trusts help-output parsing. Use it only if probes are your confirmed problem — probes are what catch broken setups *before* they waste your time.
 
