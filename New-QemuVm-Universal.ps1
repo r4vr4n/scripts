@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    New-GpuVm.ps1 v3.2 - GPU-accelerated Omarchy/Ubuntu QEMU VM builder for
+    New-GpuVm.ps1 v3.5 - GPU-accelerated Omarchy/Ubuntu QEMU VM builder for
     Windows x86_64 hosts (WHPX), with a safe-exit design.
 
 .DESCRIPTION
@@ -23,6 +23,17 @@
 .PARAMETER SkipProbes       Skip WHPX/GPU launch probes (assume from help output)
 .PARAMETER NoPause          Do not pause before closing on error
 .PARAMETER LaunchNow        Boot the installer immediately after setup
+.PARAMETER WinqEmuDir       Where the virgl-capable WINQ-EMU build lives; installed
+                            there from GitHub (after asking) if missing. Default C:\WINQ-EMU
+.PARAMETER UsePathQemu      Skip WINQ-EMU and use qemu-system-x86_64.exe from PATH
+.PARAMETER Firmware         Auto (default) | Bios | Uefi. Auto = BIOS for a new/empty disk
+                            (WINQ-EMU: EFI slows Venus init). For an installed disk it keeps
+                            what the existing launcher used; with no launcher, UEFI only if
+                            UEFI NVRAM is present
+.PARAMETER Fresh            Start over: delete this distro's disk(s), NVRAM and launchers in
+                            VmDir (after listing them) and rebuild. setup-log.txt is kept
+.PARAMETER SkipProfileCommand  Don't offer to add a '<distro>' launch command to the
+                            PowerShell 5.1/7 profiles (asked by default; never in -Unattended)
 
 .EXAMPLE
     .\New-GpuVm.ps1 -Verbose
@@ -52,7 +63,12 @@ param(
     [switch]$Unattended,
     [switch]$SkipProbes,
     [switch]$NoPause,
-    [switch]$LaunchNow
+    [switch]$LaunchNow,
+    [string]$WinqEmuDir = 'C:\WINQ-EMU',
+    [switch]$UsePathQemu,
+    [ValidateSet('Auto', 'Bios', 'Uefi')][string]$Firmware = 'Auto',
+    [switch]$Fresh,
+    [switch]$SkipProfileCommand
 )
 
 # ------------------------------------------------------------- state & helpers
@@ -122,10 +138,11 @@ function Test-Admin {
 # paths. WHPX + device realize still run, so real failures surface HERE,
 # not at first VM boot. Success = process still alive after N seconds.
 function Test-QemuLaunch {
-    param([string[]]$QemuArgs, [string]$Tag, [int]$Seconds = 4)
+    # -Display: virtio-*-gl devices refuse to realize without a gl=on display
+    param([string[]]$QemuArgs, [string]$Tag, [int]$Seconds = 4, [string]$Display = 'none')
     $safeTag = ($Tag -replace '[^a-zA-Z0-9_-]', '_')
     $errFile = Join-Path $script:vmDir ("probe-{0}.err" -f $safeTag)
-    $argList = @('-name', "probe-$safeTag", '-machine', 'q35', '-nodefaults', '-display', 'none', '-monitor', 'none', '-S') + $QemuArgs
+    $argList = @('-name', "probe-$safeTag", '-machine', 'q35', '-nodefaults', '-display', $Display, '-monitor', 'none', '-S') + $QemuArgs
     $p = $null; $ok = $false; $detail = ''
     try {
         $sp = @{
@@ -166,10 +183,101 @@ function Save-FirmwareFile {
     finally { $ProgressPreference = $prev }
 }
 
+# Adds/refreshes a managed "function <Name> { & '<launcher>' @args }" block in the
+# user's PowerShell profiles (5.1 always; 7 if installed). Idempotent: the block
+# between the markers is replaced on every run, so a moved VM gets the new path.
+function Add-ProfileCommand {
+    param([string]$Name, [string]$Launcher, [string]$Tag)
+    $docs = [Environment]::GetFolderPath('MyDocuments')
+    $profiles = @(Join-Path $docs 'WindowsPowerShell\Microsoft.PowerShell_profile.ps1')
+    if ((Get-Command pwsh -ErrorAction SilentlyContinue) -or (Test-Path "$env:ProgramFiles\PowerShell\7\pwsh.exe") -or (Test-Path (Join-Path $docs 'PowerShell'))) {
+        $profiles += Join-Path $docs 'PowerShell\Microsoft.PowerShell_profile.ps1'
+    }
+    $begin = "# >>> New-GpuVm: $Tag >>>"; $end = "# <<< New-GpuVm: $Tag <<<"
+    $block = @($begin, "# generated $(Get-Date -Format 'yyyy-MM-dd HH:mm') - usage: $Name [-FullScreen] [-SafeGraphics] [-BootInstaller]",
+        "function $Name { & '$($Launcher.Replace("'", "''"))' @args }", $end) -join "`r`n"
+    $written = @()
+    foreach ($p in $profiles) {
+        try {
+            $dir = Split-Path -Parent $p
+            if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+            $text = if (Test-Path $p) { [IO.File]::ReadAllText($p) } else { '' }
+            $rx = '(?s)' + [regex]::Escape($begin) + '.*?' + [regex]::Escape($end)
+            $m = [regex]::Match($text, $rx)
+            if ($m.Success) { $text = $text.Remove($m.Index, $m.Length).Insert($m.Index, $block) }
+            else { $text = $text.TrimEnd() + $(if ($text.Trim()) { "`r`n`r`n" } else { '' }) + $block + "`r`n" }
+            [IO.File]::WriteAllText($p, $text, (New-Object Text.UTF8Encoding $true))   # BOM: PS 5.1 reads BOM-less UTF-8 as ANSI
+            $written += $p; Log "Profile command '$Name' written to $p"
+        }
+        catch { Warn "Could not update profile '$p': $($_.Exception.Message)" }
+    }
+    # a profile only loads if the (non-process) execution policy allows scripts
+    $eff = 'Restricted'
+    foreach ($s in 'MachinePolicy', 'UserPolicy', 'CurrentUser', 'LocalMachine') {
+        $v = Get-ExecutionPolicy -Scope $s; if ($v -ne 'Undefined') { $eff = "$v"; break }
+    }
+    if ($eff -in 'Restricted', 'AllSigned') {
+        Warn "Execution policy is '$eff', so profiles will not load and '$Name' won't exist. Fix once: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned"
+    }
+    return $written
+}
+
+function Find-QemuUnder {
+    param([string]$Root)   # WINQ-EMU layout may be <root>\ or <root>\bin\
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return $null }
+    Get-ChildItem -LiteralPath $Root -Filter 'qemu-system-x86_64.exe' -Recurse -Depth 3 -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+
+# Downloads the latest WINQ-EMU (virgl + Venus Windows QEMU build) NSIS installer
+# from GitHub and installs it silently into $Dir. Asks first: Unattended never
+# installs third-party software on its own.
+function Install-WinqEmu {
+    param([string]$Dir)
+    $prev = $ProgressPreference; $ProgressPreference = 'SilentlyContinue'   # 5.1 IWR progress is very slow
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072   # TLS 1.2
+        try { $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/cmspam/winq-emu/releases/latest' -UseBasicParsing -Headers @{ 'User-Agent' = 'New-GpuVm' } }
+        catch { Fail 'TOOL' ("Cannot query WINQ-EMU releases on GitHub: {0}. Install it manually from https://github.com/cmspam/winq-emu/releases into '{1}', or re-run with -UsePathQemu." -f $_.Exception.Message, $Dir) }
+        $asset = $rel.assets | Where-Object { $_.name -like '*-Setup.exe' } | Select-Object -First 1
+        if (-not $asset) { Fail 'TOOL' "WINQ-EMU release '$($rel.tag_name)' has no *-Setup.exe asset. Install manually or re-run with -UsePathQemu." }
+        Log ("WINQ-EMU latest: {0} ({1}, {2:N0} bytes)" -f $rel.tag_name, $asset.name, $asset.size)
+
+        $a = Ask ("Download and install WINQ-EMU {0} ({1:N0} MB) from github.com/cmspam/winq-emu into '{2}'?" -f $rel.tag_name, ($asset.size / 1MB), $Dir) 'y', 'n' 'y' 'n'
+        if ($a -ne 'y') { Fail 'ABORT' "WINQ-EMU not installed. Install it into '$Dir' yourself, or re-run with -UsePathQemu to use QEMU from PATH." }
+
+        $dlDir = Join-Path $env:TEMP 'winq-emu'
+        New-Item -ItemType Directory -Path $dlDir -Force | Out-Null
+        $setup = Join-Path $dlDir $asset.name
+        if (-not (Test-Path $setup) -or (Get-Item $setup).Length -ne $asset.size) {
+            Write-Host ("Downloading {0} ({1:N0} MB)..." -f $asset.name, ($asset.size / 1MB))
+            try { Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $setup -UseBasicParsing }
+            catch { Remove-Item $setup -Force -ErrorAction SilentlyContinue; Fail 'TOOL' "WINQ-EMU download failed: $($_.Exception.Message)" }
+        }
+        $len = (Get-Item $setup).Length
+        if ($len -ne $asset.size) { Remove-Item $setup -Force; Fail 'TOOL' "WINQ-EMU download size mismatch: expected $($asset.size), got $len bytes." }
+        if ($asset.digest -match '^sha256:([0-9a-fA-F]{64})$') {
+            $want = $Matches[1].ToUpper(); $got = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
+            if ($got -ne $want) { Remove-Item $setup -Force; Fail 'TOOL' "WINQ-EMU installer SHA256 mismatch: expected $want, got $got." }
+            Log 'WINQ-EMU installer SHA256 verified against GitHub digest.'
+        }
+        else { Log 'GitHub published no SHA256 digest for the installer; size check only.' }
+        $sig = Get-AuthenticodeSignature -LiteralPath $setup
+        Log ("WINQ-EMU installer Authenticode: {0} {1}" -f $sig.Status, $(if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }))
+
+        Write-Host "Installing WINQ-EMU into $Dir (silent; accept the UAC prompt if one appears)..."
+        # NSIS: /S = silent; /D= must be LAST and unquoted
+        $p = Start-Process -FilePath $setup -ArgumentList '/S', "/D=$Dir" -Wait -PassThru
+        if ($p.ExitCode -ne 0) { Fail 'TOOL' "WINQ-EMU installer exited $($p.ExitCode). Run '$setup' manually, or re-run with -UsePathQemu." }
+        Log "WINQ-EMU $($rel.tag_name) installed into $Dir"
+    }
+    finally { $ProgressPreference = $prev }
+}
+
 # ============================================================== MAIN
 try {
-    Write-Host '=== New-GpuVm v3.2 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
-    Log 'Setup started (New-GpuVm v3.2).'
+    Write-Host '=== New-GpuVm v3.5 - Omarchy/Ubuntu QEMU builder (safe-exit) ===' -ForegroundColor Cyan
+    Log 'Setup started (New-GpuVm v3.5).'
 
     # ---------------------------------------------------- [1/9] inputs
     if (-not $IsoPath) { $IsoPath = Read-Host 'Path to the Omarchy/Ubuntu ISO' }
@@ -203,10 +311,26 @@ try {
     }
 
     # ---------------------------------------------------- [2/9] QEMU health
-    $qemuCmd = Get-Command qemu-system-x86_64.exe -ErrorAction SilentlyContinue
-    if (-not $qemuCmd) { Fail 'INPUT' 'qemu-system-x86_64.exe is not on PATH. Install QEMU or add its bin folder to PATH.' }
-    $script:qemuExe = $qemuCmd.Source
+    if ($UsePathQemu) {
+        $qemuCmd = Get-Command qemu-system-x86_64.exe -ErrorAction SilentlyContinue
+        if (-not $qemuCmd) { Fail 'INPUT' 'qemu-system-x86_64.exe is not on PATH. Install QEMU or add its bin folder to PATH.' }
+        $script:qemuExe = $qemuCmd.Source
+        $isWinq = $false
+    }
+    else {
+        $isWinq = $true
+        # virgl-capable build: reuse an existing WINQ-EMU install, install only if missing
+        $script:qemuExe = Find-QemuUnder $WinqEmuDir
+        if ($script:qemuExe) { Log "WINQ-EMU found: $script:qemuExe (reused)" }
+        else {
+            Install-WinqEmu $WinqEmuDir
+            $script:qemuExe = Find-QemuUnder $WinqEmuDir
+            if (-not $script:qemuExe) { Fail 'TOOL' "WINQ-EMU installed but qemu-system-x86_64.exe not found under '$WinqEmuDir'." }
+        }
+    }
     $qemuDir = Split-Path -Parent $script:qemuExe
+    $env:PATH = "$qemuDir;$env:PATH"   # this process only: DLLs + qemu-img resolve from the chosen build
+    Log "QEMU binary: $script:qemuExe"
 
     $verOut = Get-NativeOutput $script:qemuExe @('--version')
     if ($LASTEXITCODE -ne 0 -or -not $verOut) {
@@ -230,6 +354,9 @@ try {
     elseif ($devHelp -match 'virtio-gpu') { $gpuDev = 'virtio-gpu'; $gpuKind = '2d'; $needsVgaNone = $true }
     else { $gpuDev = 'VGA'; $gpuKind = 'none' }
     Log "GPU device detection: $gpuDev (kind=$gpuKind, vga-none=$needsVgaNone)"
+    $safeGpu = if ($devHelp -match 'virtio-vga') { 'virtio-vga' } else { 'VGA' }   # launcher -SafeGraphics
+    $vsound = $devHelp -match 'virtio-sound-pci'   # WINQ-EMU's tested audio path
+    $audioName = if ($vsound) { 'virtio-sound' } else { 'ICH9 HDA' }
 
     # display backend must exist, or the launcher would fail on every boot
     $dispHelp = Get-NativeOutput $script:qemuExe @('-display', 'help')
@@ -334,14 +461,21 @@ try {
     if ($gpuKind -eq 'gl') {
         $hostmemGB = [math]::Max(1, [math]::Min(4, [int][math]::Floor($RamGB / 2)))
         $gpuArg = '{0},hostmem={1}G,blob=true' -f $gpuDev, $hostmemGB
-        if ($isOma -and $qVer -ge [version]'9.2.0') { $gpuArg += ',venus=true' }   # Hyprland: Vulkan via Venus
+        # Vulkan via Venus: Hyprland needs it; WINQ-EMU's tested config enables it for every guest
+        if (($isOma -or $isWinq) -and $qVer -ge [version]'9.2.0') { $gpuArg += ',venus=true' }
     }
     else {
         $gpuArg = $gpuDev
     }
     if ($gpuKind -ne 'none' -and -not $SkipProbes) {
-        Write-Host 'Probing GPU device init (~4 s)...'
-        $r = Test-QemuLaunch -QemuArgs @('-accel', $accel, '-device', $gpuArg) -Tag 'gpu'
+        $probeDisplay = if ($gpuKind -eq 'gl') { $display } else { 'none' }
+        Write-Host 'Probing GPU device init (~4 s; a blank VM window may flash)...'
+        $r = Test-QemuLaunch -QemuArgs @('-accel', $accel, '-device', $gpuArg) -Tag 'gpu' -Display $probeDisplay
+        if (-not $r.OK -and $gpuArg -like '*,venus=true') {   # second chance: GL without Vulkan forwarding
+            Warn "GPU '$gpuArg' failed to initialize ($($r.Detail)); retrying without venus."
+            $gpuArg = $gpuArg -replace ',venus=true$', ''
+            $r = Test-QemuLaunch -QemuArgs @('-accel', $accel, '-device', $gpuArg) -Tag 'gpu-novenus' -Display $probeDisplay
+        }
         if (-not $r.OK) {
             Warn "GPU '$gpuArg' failed to initialize: $($r.Detail)"
             $alt = if ($devHelp -match 'virtio-vga') { 'virtio-vga' } elseif ($devHelp -match 'virtio-gpu') { 'virtio-gpu' } else { 'VGA' }
@@ -355,33 +489,38 @@ try {
         Confirm-OrAbort ('No working VirGL 3D path detected - the guest will SOFTWARE-render (llvmpipe). Better: install a virgl-capable Windows QEMU build (WINQ-EMU / qemu-virgl-whpx) and re-run.')
     }
 
-    # ---------------------------------------------------- [7/9] firmware (OVMF)
-    $code = $null; $varsTpl = $null
-    $fwDirs = @($qemuDir, (Join-Path $qemuDir 'share'), (Join-Path $qemuDir 'share\qemu'), (Join-Path $qemuDir 'pc-bios'), (Join-Path $qemuDir '..\share\qemu'))
-    foreach ($d in $fwDirs) { if (-not $code) { $c = Join-Path $d 'edk2-x86_64-code.fd'; if (Test-Path $c) { $code = $c } } }
-    foreach ($d in $fwDirs) { if (-not $varsTpl) { $v = Join-Path $d 'edk2-i386-vars.fd'; if (Test-Path $v) { $varsTpl = $v } } }
-    if (-not $code) {
-        Write-Warning 'OVMF code image not found next to QEMU - downloading (qemu v9.2.0).'
-        $code = Join-Path $script:vmDir 'edk2-x86_64-code.fd'
-        Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-x86_64-code.fd' $code 1MB
-    }
-    if (-not $varsTpl) {
-        Write-Warning 'OVMF vars template not found - downloading.'
-        $varsTpl = Join-Path $script:vmDir 'edk2-i386-vars.fd'
-        Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-i386-vars.fd' $varsTpl 100KB
-    }
-    Log "Firmware: code=$code vars-template=$varsTpl"
-
-    $vars = Join-Path $script:vmDir "${distro}-VARS.fd"
-    if (Test-Path $vars) { Log 'NVRAM preserved (idempotent re-run).' }
-    else { Copy-Item $varsTpl $vars; Log 'NVRAM created from template.' }
-
-    # ---------------------------------------------------- [8/9] disk + port
+    # ---------------------------------------------------- [7/9] disk + port
     $qemuImg = Join-Path $qemuDir 'qemu-img.exe'
     if (-not (Test-Path $qemuImg)) {
         $qi = Get-Command qemu-img.exe -ErrorAction SilentlyContinue
         if (-not $qi) { Fail 'TOOL' 'qemu-img.exe not found next to QEMU nor on PATH - cannot create the disk.' }
         $qemuImg = $qi.Source
+    }
+    if ($Fresh) {
+        # start over: only files this script creates for this distro; setup-log.txt is kept
+        $rx = '^{0}(-\d+)?\.qcow2$|^{0}-VARS\.fd$|^{0}-launch\.(ps1|cmd)(\.bak-.*)?$|^probe-.*\.err$' -f [regex]::Escape($distro)
+        $old = @(Get-ChildItem -LiteralPath $script:vmDir -File | Where-Object { $_.Name -match $rx })
+        if ($old.Count) {
+            $oldDisks = @($old | Where-Object Extension -eq '.qcow2' | ForEach-Object FullName)
+            $running = @(Get-CimInstance Win32_Process -Filter "Name LIKE 'qemu-system%'" -ErrorAction SilentlyContinue |
+                    Where-Object { $cl = $_.CommandLine; $cl -and ($oldDisks | Where-Object { $cl.IndexOf($_, [StringComparison]::OrdinalIgnoreCase) -ge 0 }) })
+            if ($running.Count) {
+                $a = Ask "This VM is running (PID $($running.ProcessId -join ', ')) - stop it (hard power-off)?" 'y', 'n' 'n' 'n'
+                if ($a -ne 'y') { Fail 'ABORT' 'VM is running - shut it down from inside the guest, then re-run with -Fresh.' }
+                $running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+                Start-Sleep -Seconds 2   # let QEMU release the disk lock
+                Log "Stopped running VM (PID $($running.ProcessId -join ', ')) for -Fresh."
+            }
+            Write-Warning '-Fresh: these files will be DELETED:'
+            $old | ForEach-Object { Write-Host ('  {0,-40} {1,12:N0} bytes' -f $_.Name, $_.Length) }
+            $a = Ask "Delete these $($old.Count) files and start over?" 'y', 'n' 'y' 'y'   # -Fresh itself is the consent
+            if ($a -ne 'y') { Fail 'ABORT' 'User declined -Fresh cleanup.' }
+            foreach ($f in $old) {
+                try { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop; Log "-Fresh: deleted $($f.Name)" }
+                catch { Fail 'ENV' "-Fresh could not delete '$($f.FullName)': $($_.Exception.Message)" }
+            }
+        }
+        else { Log '-Fresh: nothing to delete.' }
     }
     $disk = Join-Path $script:vmDir "${distro}.qcow2"
     if (Test-Path $disk) {
@@ -408,6 +547,50 @@ try {
     }
     if ($tries -ge 25) { Fail 'ENV' 'No free ssh port found in 2222-2246.' }
 
+    # ---------------------------------------------------- [8/9] firmware
+    # BIOS unless a UEFI install must be preserved: switching an installed UEFI disk
+    # to BIOS leaves it unbootable. -U: read even if a running VM holds the lock.
+    $vars = Join-Path $script:vmDir "${distro}-VARS.fd"
+    $diskUsed = 0
+    try { $diskUsed = [long]((Invoke-Native $qemuImg @('info', '-U', '--output=json', $disk) 'qemu-img info') | ConvertFrom-Json).'actual-size' } catch {}
+    # an existing launcher is the ground truth for how the installed disk boots
+    # (a stale VARS.fd from an earlier UEFI attempt must not flip a BIOS install)
+    $prevLauncher = Join-Path $script:vmDir "${distro}-launch.ps1"
+    $prevFw = $null
+    if (Test-Path $prevLauncher) { $prevFw = if (Select-String -LiteralPath $prevLauncher -Pattern 'if=pflash' -Quiet) { 'uefi' } else { 'bios' } }
+    $uefiInstalled = if ($prevFw) { $prevFw -eq 'uefi' } else { ($diskUsed -gt 1MB) -and (Test-Path $vars) }
+    $uefiInstalled = $uefiInstalled -and ($diskUsed -gt 1MB)
+    $fw = $Firmware.ToLower()
+    if ($fw -eq 'auto') { $fw = if ($uefiInstalled) { 'uefi' } else { 'bios' } }
+    elseif ($fw -eq 'bios' -and $uefiInstalled) { Warn "Disk holds data and UEFI NVRAM exists: a system installed under UEFI will NOT boot with -Firmware Bios." }
+    Log ("Firmware: {0} (requested {1}; disk actual-size {2:N0} bytes, NVRAM present: {3}, previous launcher: {4})" -f $fw, $Firmware, $diskUsed, (Test-Path $vars), $(if ($prevFw) { $prevFw } else { 'none' }))
+
+    if ($fw -eq 'uefi') {
+        $code = $null; $varsTpl = $null
+        $fwDirs = @($qemuDir, (Join-Path $qemuDir 'share'), (Join-Path $qemuDir 'share\qemu'), (Join-Path $qemuDir 'pc-bios'), (Join-Path $qemuDir '..\share\qemu'))
+        foreach ($d in $fwDirs) { if (-not $code) { $c = Join-Path $d 'edk2-x86_64-code.fd'; if (Test-Path $c) { $code = $c } } }
+        foreach ($d in $fwDirs) { if (-not $varsTpl) { $v = Join-Path $d 'edk2-i386-vars.fd'; if (Test-Path $v) { $varsTpl = $v } } }
+        if (-not $code) {
+            Write-Warning 'OVMF code image not found next to QEMU - downloading (qemu v9.2.0).'
+            $code = Join-Path $script:vmDir 'edk2-x86_64-code.fd'
+            Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-x86_64-code.fd' $code 1MB
+        }
+        if (-not $varsTpl) {
+            Write-Warning 'OVMF vars template not found - downloading.'
+            $varsTpl = Join-Path $script:vmDir 'edk2-i386-vars.fd'
+            Save-FirmwareFile 'https://raw.githubusercontent.com/qemu/qemu/v9.2.0/pc-bios/edk2-i386-vars.fd' $varsTpl 100KB
+        }
+        Log "OVMF: code=$code vars-template=$varsTpl"
+        if (Test-Path $vars) { Log 'NVRAM preserved (idempotent re-run).' }
+        else { Copy-Item $varsTpl $vars; Log 'NVRAM created from template.' }
+        $fwLines = "    # UEFI/OVMF: read-only firmware code + writable per-VM NVRAM`r`n" +
+                   "    '-drive','if=pflash,format=raw,readonly=on,file=$code',`r`n" +
+                   "    '-drive','if=pflash,format=raw,file=$vars',"
+    }
+    else {
+        $fwLines = "    # BIOS (SeaBIOS, QEMU default) - WINQ-EMU: EFI boot slows Venus/Vulkan init"
+    }
+
     # ---------------------------------------------------- [9/9] launcher
     $launchPs1 = Join-Path $script:vmDir "${distro}-launch.ps1"
     $launchCmd = Join-Path $script:vmDir "${distro}-launch.cmd"
@@ -418,19 +601,23 @@ try {
     }
 
     $launcher = @'
-# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3.2 on @DATE@.
+# @DISTRO@ VM launcher - generated by New-GpuVm.ps1 v3.5 on @DATE@.
 # Re-running setup regenerates this file (previous copy saved as .bak-*).
-# Usage: .\@DISTRO@-launch.ps1 [-BootInstaller] [-FullScreen]
+# Usage: .\@DISTRO@-launch.ps1 [-BootInstaller] [-FullScreen] [-SafeGraphics]
 #   -BootInstaller  boot the ISO (first install, or rescue/reinstall later)
 #   -FullScreen     start fullscreen; Ctrl+Alt+F toggles any time
+#   -SafeGraphics   plain 2D (no virgl/Venus): use if the desktop glitches or 3D breaks
 # After first install, run WITHOUT -BootInstaller.
 # Verify 3D inside the guest:  glxinfo -B   -> renderer must be virgl (NOT llvmpipe).
 param(
     [switch]$BootInstaller,
-    [switch]$FullScreen
+    [switch]$FullScreen,
+    [switch]$SafeGraphics
 )
  $ErrorActionPreference = 'Stop'
- $hdBoot = if ($BootInstaller) { 1 } else { 0 }   # OVMF boots by bootindex, not -boot order
+ $hdBoot = if ($BootInstaller) { 1 } else { 0 }   # firmware boots by bootindex, not -boot order
+ $gpu = '@GPU@'; $disp = '@DISPLAY@'
+ if ($SafeGraphics) { $gpu = '@SAFEGPU@'; $disp = $disp -replace 'gl=on', 'gl=off' }
 
  $qemu = '@QEMU@'
  $a = @(
@@ -441,16 +628,14 @@ param(
     '-smp','@SMP@',                                          # @VCPUS@ vCPUs, 1 socket
     '-m','@RAM@G',                                           # guest RAM
     '-nodefaults',                                           # nothing implicit: every device below is deliberate
-    # UEFI/OVMF: read-only firmware code + writable per-VM NVRAM
-    '-drive','if=pflash,format=raw,readonly=on,file=@CODE@',
-    '-drive','if=pflash,format=raw,file=@VARS@',
+@FIRMWARE@
     # GPU: virtio-*-gl = paravirt GPU with VirGL 3D (host GL via ANGLE on Windows builds)
     #      blob+hostmem = required for GL4.6/Venus; venus=true adds Vulkan forwarding
-    '-device','@GPU@',
+    '-device',$gpu,
 @VGANONE@
     # SDL window with a host OpenGL context; gl=on is REQUIRED for virgl; vsync'd presentation
-    '-display','@DISPLAY@',
-    # system disk on virtio-blk; bootindex decides UEFI boot order
+    '-display',$disp,
+    # system disk on virtio-blk; bootindex decides boot order
     '-drive','file=@DISK@,if=none,id=hd,format=qcow2',
     '-device',"virtio-blk-pci,drive=hd,bootindex=$hdBoot",
     # input: xHCI + tablet (seamless pointer) + keyboard; rng avoids boot-time entropy stalls
@@ -460,8 +645,8 @@ param(
     '-netdev','user,id=n0,hostfwd=tcp:127.0.0.1:@PORT@-:22',
     '-rtc','base=utc'                                        # correct clock for Linux guests
 )
-if (@HAVEAUDIO@) {   # audio: DirectSound backend -> ICH9 HDA (PipeWire auto-detects in guest)
-    $a += @('-audiodev','dsound,id=ao','-device','ich9-intel-hda','-device','hda-dup,audiodev=ao')
+if (@HAVEAUDIO@) {   # audio: DirectSound backend -> @AUDIONAME@ (PipeWire auto-detects in guest)
+    $a += @('-audiodev','dsound,id=ao',@AUDIODEV@)
 }
 if ($BootInstaller) {   # installer ISO with top boot priority while installing
     $a += @('-drive','file=@ISO@,if=none,id=cd,readonly=on','-device','ide-cd,drive=cd,bootindex=0')
@@ -482,9 +667,11 @@ exit $LASTEXITCODE
         '@SMP@'       = "$Vcpus,sockets=1,cores=$Vcpus,threads=1"
         '@VCPUS@'     = "$Vcpus"
         '@RAM@'       = "$RamGB"
-        '@CODE@'      = $code
-        '@VARS@'      = $vars
+        '@FIRMWARE@'  = $fwLines
         '@GPU@'       = $gpuArg
+        '@SAFEGPU@'   = $safeGpu
+        '@AUDIODEV@'  = $(if ($vsound) { "'-device','virtio-sound-pci,audiodev=ao'" } else { "'-device','ich9-intel-hda','-device','hda-duplex,audiodev=ao'" })
+        '@AUDIONAME@' = $audioName
         '@DISPLAY@'   = $display
         '@VGANONE@'   = $(if ($needsVgaNone) { "    '-vga','none'," } else { '' })
         '@DISK@'      = $disk
@@ -500,22 +687,35 @@ exit $LASTEXITCODE
     Set-Content -LiteralPath $launchPs1 -Value $launcher -Encoding UTF8
     $cmdBody = '@echo off' + [Environment]::NewLine + 'powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0' + $distro + '-launch.ps1" %*' + [Environment]::NewLine
     Set-Content -LiteralPath $launchCmd -Value $cmdBody -Encoding ASCII
-    Log "Launcher written: $launchPs1 (accel=$accel gpu=$gpuArg display=$display port=$port audio=$audioOK)"
+    Log "Launcher written: $launchPs1 (accel=$accel firmware=$fw gpu=$gpuArg display=$display port=$port audio=$(if ($audioOK) { $audioName } else { 'none' }))"
+
+    # terminal shortcut: "<distro>" (or "<distro>-vm" if that name is taken, e.g. WSL's ubuntu.exe)
+    $profCmd = $null
+    if (-not $SkipProfileCommand) {
+        $profCmd = $distro
+        if (Get-Command $profCmd -CommandType Application, ExternalScript -ErrorAction SilentlyContinue) { $profCmd = "$distro-vm" }
+        $a = Ask "Add a '$profCmd' command to your PowerShell profile to launch this VM?" 'y', 'n' 'y' 'n'
+        if ($a -eq 'y') { if (-not (Add-ProfileCommand -Name $profCmd -Launcher $launchPs1 -Tag $distro)) { $profCmd = $null } }
+        else { $profCmd = $null; Log 'Profile command skipped by user.' }
+    }
 
     # ---------------------------------------------------- summary
     Write-Host ''
     Write-Host '================= VM ready =================' -ForegroundColor Green
     Write-Host " Distro      : $distro"
     Write-Host " Accelerator : $accel"
+    Write-Host " Firmware    : $fw"
     Write-Host " GPU device  : $gpuArg"
     Write-Host " Display     : $display"
-    Write-Host " Audio       : $(if ($audioOK) { 'dsound -> ICH9 HDA' } else { 'none (backend missing)' })"
+    Write-Host " Audio       : $(if ($audioOK) { "dsound -> $audioName" } else { 'none (backend missing)' })"
     Write-Host " Disk        : $disk"
     Write-Host " Launcher    : $launchPs1  (or ${distro}-launch.cmd)"
+    if ($profCmd) { Write-Host " Command     : $profCmd   (new terminals; this one: . `$PROFILE)" }
     Write-Host " Guest ssh   : ssh -p $port <user>@localhost"
     Write-Host " Log         : $script:LogPath   (warnings: $script:Warns)"
     Write-Host '--------------------------------------------'
-    Write-Host ' 1. Run with -BootInstaller to install to disk'
+    Write-Host " 1. Install: ${distro}-launch.ps1 -BootInstaller -SafeGraphics  (2D; live installer glitches under virgl)"
+    Write-Host "    Daily  : ${distro}-launch.ps1  (3D)"
     Write-Host ' 2. In guest: glxinfo -B  -> renderer must be virgl, NOT llvmpipe'
     if ($isOma) { Write-Host ' 3. Hyprland mode: monitor = Virtual-1,1920x1080@144,0x0,1  (judge with a vsync test)' }
     else { Write-Host ' 3. GNOME may cap at 60 Hz; verify with a browser vsync test on the physical console' }
@@ -524,7 +724,7 @@ exit $LASTEXITCODE
 
     $doLaunch = $LaunchNow
     if (-not $doLaunch -and -not $Unattended) { $doLaunch = (Ask 'Launch the VM now (installer)?' 'y', 'n' 'n' 'n') -eq 'y' }
-    if ($doLaunch) { & $launchPs1 -BootInstaller }
+    if ($doLaunch) { & $launchPs1 -BootInstaller -SafeGraphics }   # install in 2D; 3D is for the installed desktop
     $script:exitCode = 0
 }
 catch {
@@ -553,4 +753,4 @@ finally {
     }
 }
 exit $script:exitCode
-# --- EOF: New-GpuVm.ps1 v3.2 ---
+# --- EOF: New-GpuVm.ps1 v3.5 ---

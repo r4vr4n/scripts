@@ -60,7 +60,15 @@ You don't have to do this beforehand — if it's missing, the script detects it,
 
 ### 2.3 Install QEMU — ⚠ the critical step
 
-Stock QEMU from qemu.org or MSYS2 is 2D-only on Windows. Your guest will software-render (llvmpipe) — the script will detect this and warn you, but it cannot fix it. For real 3D you need a virgl-capable Windows build on PATH:
+**Automatic (default since v3.3):** the script looks for WINQ-EMU in `-WinqEmuDir` (default `C:\WINQ-EMU`) and reuses it if it's there. If it's missing, the script asks and then:
+
+1. Downloads the latest `*-Setup.exe` from [github.com/cmspam/winq-emu/releases](https://github.com/cmspam/winq-emu/releases).
+2. Checks its size and the SHA256 digest GitHub publishes.
+3. Installs it silently (NSIS `/S`). Accept the UAC prompt if one appears.
+
+Pass `-UsePathQemu` to skip this and use whatever `qemu-system-x86_64.exe` is on PATH (the manual route below).
+
+**Manual:** stock QEMU from qemu.org or MSYS2 is 2D-only on Windows. Your guest will software-render (llvmpipe) — the script will detect this and warn you, but it cannot fix it. For real 3D you need a virgl-capable Windows build on PATH:
 
 | BUILD | WHAT YOU GET |
 | --- | --- |
@@ -162,6 +170,11 @@ All parameters are optional; the script asks for ISO path and VM directory inter
 | `-SkipProbes` | switch | Skip the live WHPX/GPU launch probes and assume from help output. Only if probes hang on exotic hardware. |
 | `-NoPause` | switch | Don't pause for Enter on error (for scripted runs). |
 | `-LaunchNow` | switch | Boot the installer immediately after setup succeeds. |
+| `-WinqEmuDir` | string, `C:\WINQ-EMU` | Where the virgl-capable WINQ-EMU build is reused from, or installed to (after asking) if missing. |
+| `-UsePathQemu` | switch | Don't use or install WINQ-EMU; use `qemu-system-x86_64.exe` from PATH (pre-v3.3 behavior). |
+| `-Fresh` | switch | Start over. Lists and deletes this distro's `.qcow2` disk(s), `-VARS.fd`, launchers (+ `.bak-*`) and stale `probe-*.err` in `VmDir`, then rebuilds. Offers to hard-stop the VM if it's running. `setup-log.txt` is kept. Use while iterating; **never after you've installed something you want to keep.** |
+| `-SkipProfileCommand` | switch | Don't offer to add a `<distro>` launch command (e.g. `ubuntu`) to your PowerShell 5.1/7 profiles. By default the script asks (default yes) just before launching the installer. The name becomes `<distro>-vm` if `<distro>` is already a program (e.g. WSL's `ubuntu.exe`). The block is managed between `# >>> New-GpuVm` markers and refreshed on every run. |
+| `-Firmware` | `Auto` (default) / `Bios` / `Uefi` | `Auto` picks BIOS for a new or empty disk, because WINQ-EMU says EFI slows Venus/Vulkan init. It picks UEFI only when the disk already holds data **and** `<distro>-VARS.fd` exists, so a VM installed under UEFI keeps booting. |
 | `-Verbose` | switch (common) | Streams every decision as it's made; also written to `setup-log.txt` regardless. |
 
 Examples:
@@ -185,13 +198,13 @@ Nine phases, in order. Every ⚡ item is a live probe — a real test, not an as
 | PHASE | WHAT IT CHECKS / DOES |
 | --- | --- |
 | 1. Inputs | ARM64 host guard → ISO exists/sane size/.iso extension → VM dir created, writability probed → OneDrive warnings → optional SHA256 verification |
-| 2. QEMU health | ⚡ Binary actually runs (catches missing-DLL installs) → version parsed → ⚡ `-device help` parsed: picks the best GPU device (`virtio-vga-gl` > `virtio-gpu-gl` > `virtio-vga` > `virtio-gpu` > `VGA`) → ⚡ `-display help`: SDL preferred, GTK fallback → ⚡ `-audiodev help`: `dsound` present? |
+| 2. QEMU health | WINQ-EMU in `-WinqEmuDir` reused, or downloaded + verified + installed after asking (`-UsePathQemu`: PATH instead) → ⚡ Binary actually runs (catches missing-DLL installs) → version parsed → ⚡ `-device help` parsed: picks the best GPU device (`virtio-vga-gl` > `virtio-gpu-gl` > `virtio-vga` > `virtio-gpu` > `VGA`) → ⚡ `-display help`: SDL preferred, GTK fallback → ⚡ `-audiodev help`: `dsound` present? |
 | 3. Host sizing | Logical cores, total/free RAM, free disk vs `DiskGB`, hybrid-Intel (E-core) warning, RDP-session warning |
 | 4. Distro | From ISO filename; asks you if ambiguous (fails in `-Unattended`) |
 | 5. Accelerator | `HypervisorPresent` + feature state → if feature missing: offers to enable via DISM (admin; then exit 2 → reboot → re-run) → ⚡ live WHPX launch probe (paused VM, 4 s); on failure, one second chance with `kernel-irqchip=off` (the documented wedge workaround) → TCG only if you explicitly accept |
-| 6. GPU | Builds the device string: `hostmem` = min(4, RamGB/2) GB, `blob=true`, `venus=true` for Omarchy on QEMU ≥ 9.2 → ⚡ live device-realize probe (proves the 3D device initializes, not just that it's compiled in); on failure downgrades to 2D with your consent |
-| 7. Firmware | Finds OVMF (`edk2-x86_64-code.fd` + vars template) next to QEMU; downloads from the qemu v9.2.0 tag (TLS 1.2, size-checked) if absent → creates per-VM NVRAM copy, preserves existing |
-| 8. Disk + port | ⚡ `qemu-img` found → never overwrites: existing disk → reuse/new/abort → picks the first free ssh port from 2222 (Omarchy) / 2223 (Ubuntu) |
+| 6. GPU | Builds the device string: `hostmem` = min(4, RamGB/2) GB, `blob=true`, `venus=true` for Omarchy or WINQ-EMU on QEMU ≥ 9.2 → ⚡ live device-realize probe with the real `gl=on` display (proves the 3D device initializes, not just that it's compiled in); retries once without `venus`, then downgrades to 2D with your consent |
+| 7. Disk + port | ⚡ `qemu-img` found → never overwrites: existing disk → reuse/new/abort → picks the first free ssh port from 2222 (Omarchy) / 2223 (Ubuntu) |
+| 8. Firmware | `-Firmware Auto`: BIOS for a new/empty disk, UEFI for an installed disk with NVRAM. UEFI only: finds OVMF (`edk2-x86_64-code.fd` + vars template) next to QEMU; downloads from the qemu v9.2.0 tag (TLS 1.2, size-checked) if absent → creates per-VM NVRAM copy, preserves existing |
 | 9. Launcher | Backs up any existing launcher (`.bak-*`) → generates `<distro>-launch.ps1` + double-clickable `.cmd` shim → syntax self-check (`[scriptblock]::Create()`) before writing |
 
 ---
@@ -266,7 +279,10 @@ The launcher has two switches:
 .\omarchy-launch.ps1 -BootInstaller    # boot the ISO (first install)
 .\omarchy-launch.ps1                   # boot the installed disk (daily use)
 .\omarchy-launch.ps1 -FullScreen       # start fullscreen (Ctrl+Alt+F toggles)
+.\omarchy-launch.ps1 -SafeGraphics     # plain 2D (virtio-vga, gl=off): no 3D, but can't glitch
 ```
+
+> **Install in 2D.** The GNOME live installer flickers and ignores clicks under virgl. So since v3.5, "Launch now?" at the end of setup boots `-BootInstaller -SafeGraphics`. After the install, boot without either switch to go back to 3D.
 
 `-BootInstaller` puts the CD first in UEFI boot order (via `bootindex` — OVMF ignores legacy `-boot order=`). After installation, run without the switch and the disk boots.
 
@@ -344,6 +360,7 @@ Safe to run repeatedly, including to retune (new `-Vcpus`, different ISO, new QE
 | Existing launcher | Regenerated; old copy saved as `.bak-<timestamp>` (your manual edits don't survive regeneration — re-apply or edit the new file) |
 | OVMF files | Reused if found; re-downloaded only if missing |
 | ssh port | Re-picked from the base (2222/2223), skipping anything busy |
+| With `-Fresh` | Disk, NVRAM and launchers are listed, deleted after confirmation, and rebuilt from scratch; `setup-log.txt` is kept |
 
 Deleting `<distro>-VARS.fd` resets UEFI to factory (occasionally useful if boot entries get corrupted). Deleting the `.qcow2` deletes the installed OS — that one is always your explicit choice.
 
@@ -359,7 +376,7 @@ For scripting/CI — no prompts, safe defaults, machine-readable exit code:
 if ($LASTEXITCODE -ne 0) { throw "VM setup failed with $LASTEXITCODE" }
 ```
 
-Behavior: ambiguous ISO names fail (4) instead of guessing; degraded paths (TCG, 2D, headless) abort (2) instead of proceeding; the final "launch now?" is skipped unless `-LaunchNow`.
+Behavior: WINQ-EMU is never installed unattended, so preinstall it into `-WinqEmuDir` or pass `-UsePathQemu` (otherwise it exits 2); ambiguous ISO names fail (4) instead of guessing; degraded paths (TCG, 2D, headless) abort (2) instead of proceeding; the final "launch now?" is skipped unless `-LaunchNow`.
 
 `-SkipProbes` exists for hosts where the paused-VM probes misbehave; the script then trusts help-output parsing. Use it only if probes are your confirmed problem — probes are what catch broken setups *before* they waste your time.
 
@@ -385,6 +402,7 @@ Behavior: ambiguous ISO names fail (4) instead of guessing; degraded paths (TCG,
 | --- | --- |
 | `glxinfo -B` says llvmpipe | Host QEMU build has no virgl → install WINQ-EMU / qemu-virgl-whpx (§2.3), re-run script, verify summary shows `virtio-vga-gl,...` |
 | Launcher fails instantly at boot | Usually flags vs build mismatch → re-run the script so the launcher is regenerated against the *current* QEMU build; check `setup-log.txt` |
+| Windows leave ghost trails / smeared stacked frames | Was seen with UEFI + virgl. Re-run the script: `-Firmware Auto` picks BIOS for an empty disk and adds `venus=true` + virtio-sound (WINQ-EMU's tested config). If it still happens, install with `-SafeGraphics` |
 | No window at all | Build lacks SDL/GTK (summary would have said `Display: none`) → use a normal build |
 | Everything is slow | Summary said `Accelerator: tcg` → fix WHPX (exit-3 row above) and re-run |
 | Stuttering / bad frames over RDP | Expected — test at the physical console |
@@ -411,6 +429,15 @@ WINQ-EMU (see credits in the try-omarchy-windows README) or Tsuki-Bakery/qemu-vi
 
 **Why no copy/paste between host and guest?**
 Clipboard integration comes via SPICE, which Windows QEMU builds don't ship. Use SSH/SCP (§10).
+
+**Can I move the VM to another Windows PC?**
+Yes:
+
+1. Shut the guest down from inside.
+2. Copy `<distro>.qcow2` and the ISO (the script requires an ISO path). Don't copy `<distro>-VARS.fd` for a BIOS VM.
+3. On the new PC, enable Windows Hypervisor Platform, then run the script with the new `-VmDir`, without `-Fresh`, and answer **r** (reuse). It installs WINQ-EMU and regenerates the launcher and profile command.
+
+Optional: shrink the file for transfer with `qemu-img convert -O qcow2 -c <distro>.qcow2 small.qcow2`.
 
 **Can I move the VM folder?**
 Same path: yes. Different path/drive: re-run the script — it regenerates the launcher (absolute paths) and reuses disk + NVRAM.
