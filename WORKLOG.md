@@ -144,3 +144,43 @@ I picked WINQ-EMU: it's newer, the docs already recommend it, and it has a singl
 - ✅ WINQ-EMU probe with `virtio-vga-gl,hostmem=4G,blob=true,venus=true` + `sdl,gl=on` + virtio-sound under WHPX: still alive after 5 s.
 - ✅ `E:\Vms\ubuntu.qcow2` actual-size is 198,144 bytes, so `Auto` resolves to **BIOS**.
 - ⏳ The user re-runs the script, then checks whether the installer draws cleanly.
+
+### 10. Installer: "Next" does nothing
+
+**Result of v3.4:** the live session now draws cleanly, so the ghosting is gone. BIOS + Venus + virtio-sound works.
+
+**New problem:** on the installer's "What do you want to do with Ubuntu?" page, clicking Next has no effect.
+
+Possible causes (not yet known which):
+- **(a)** The installer backend (subiquity) is still probing, or it crashed.
+- **(b)** Pointer clicks aren't reaching the window properly.
+- **(c)** The Flutter app is stalling under virgl/Venus.
+
+Diagnosis steps sent to the user:
+1. Wait about 60 s and try again.
+2. Press `Tab` until Next is highlighted, then `Enter`.
+3. In a terminal, run `journalctl -b --no-pager | grep -iE 'subiquity|ubuntu-desktop-bootstrap|error' | tail -40`.
+4. Close and relaunch the installer.
+5. Fallback: boot with `-BootInstaller -SafeGraphics`.
+
+No script change until the cause is known.
+
+### 11. Still flickering at the corners, Next still dead → `-Fresh` + 2D install (v3.5)
+
+**Report:** under BIOS + Venus, the live installer still flickers at the window corners, and Next still does nothing.
+
+**Decision:**
+- **Start over on every failed attempt.** The user asked for this. It's an explicit `-Fresh` switch, not the default, so that a routine re-run after a real install can't wipe the OS.
+- **Install in 2D.** The GNOME live session under virgl misbehaves on both the UEFI and BIOS paths. The installer doesn't need 3D, so "Launch now?" at the end of setup now boots `-BootInstaller -SafeGraphics`. 3D is judged on the installed desktop.
+
+**`-Fresh` behaviour:**
+- Collects `<distro>(-N).qcow2`, `<distro>-VARS.fd`, `<distro>-launch.ps1/.cmd(.bak-*)` and stale `probe-*.err` in the VM dir.
+- If a QEMU process is running on those disks, it offers a hard stop. The default is no, which aborts.
+- Lists the files with their sizes and confirms (default y, since `-Fresh` is itself the consent), then deletes them and rebuilds. `setup-log.txt` is kept.
+
+**Verification (mine):**
+- ✅ Parser: 0 errors.
+- ✅ Dry-run match against `E:\Vms` finds `ubuntu.qcow2`, `ubuntu-VARS.fd`, `ubuntu-launch.ps1/.cmd`, 3 launcher backups and 2 `probe-*.err`.
+- ✅ It leaves `TryOmarchy\` and `setup-log.txt` alone.
+- ✅ The running VM (PID 50704) is matched by its disk path, so the stop prompt will appear.
+- ⏳ The user re-runs with `-Fresh`, then does the install in 2D.

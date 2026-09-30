@@ -172,6 +172,7 @@ All parameters are optional; the script asks for ISO path and VM directory inter
 | `-LaunchNow` | switch | Boot the installer immediately after setup succeeds. |
 | `-WinqEmuDir` | string, `C:\WINQ-EMU` | Where the virgl-capable WINQ-EMU build is reused from, or installed to (after asking) if missing. |
 | `-UsePathQemu` | switch | Don't use or install WINQ-EMU; use `qemu-system-x86_64.exe` from PATH (pre-v3.3 behavior). |
+| `-Fresh` | switch | Start over. Lists and deletes this distro's `.qcow2` disk(s), `-VARS.fd`, launchers (+ `.bak-*`) and stale `probe-*.err` in `VmDir`, then rebuilds. Offers to hard-stop the VM if it's running. `setup-log.txt` is kept. Use while iterating; **never after you've installed something you want to keep.** |
 | `-Firmware` | `Auto` (default) / `Bios` / `Uefi` | `Auto` picks BIOS for a new or empty disk, because WINQ-EMU says EFI slows Venus/Vulkan init. It picks UEFI only when the disk already holds data **and** `<distro>-VARS.fd` exists, so a VM installed under UEFI keeps booting. |
 | `-Verbose` | switch (common) | Streams every decision as it's made; also written to `setup-log.txt` regardless. |
 
@@ -280,7 +281,7 @@ The launcher has two switches:
 .\omarchy-launch.ps1 -SafeGraphics     # plain 2D (virtio-vga, gl=off): no 3D, but can't glitch
 ```
 
-> **Installer UI smearing or ghosting?** Boot with `-BootInstaller -SafeGraphics`, install, then boot without `-SafeGraphics` to go back to 3D.
+> **Install in 2D.** The GNOME live installer flickers and ignores clicks under virgl. So since v3.5, "Launch now?" at the end of setup boots `-BootInstaller -SafeGraphics`. After the install, boot without either switch to go back to 3D.
 
 `-BootInstaller` puts the CD first in UEFI boot order (via `bootindex` — OVMF ignores legacy `-boot order=`). After installation, run without the switch and the disk boots.
 
@@ -358,6 +359,7 @@ Safe to run repeatedly, including to retune (new `-Vcpus`, different ISO, new QE
 | Existing launcher | Regenerated; old copy saved as `.bak-<timestamp>` (your manual edits don't survive regeneration — re-apply or edit the new file) |
 | OVMF files | Reused if found; re-downloaded only if missing |
 | ssh port | Re-picked from the base (2222/2223), skipping anything busy |
+| With `-Fresh` | Disk, NVRAM and launchers are listed, deleted after confirmation, and rebuilt from scratch; `setup-log.txt` is kept |
 
 Deleting `<distro>-VARS.fd` resets UEFI to factory (occasionally useful if boot entries get corrupted). Deleting the `.qcow2` deletes the installed OS — that one is always your explicit choice.
 
