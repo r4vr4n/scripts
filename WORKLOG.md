@@ -107,3 +107,10 @@ I picked WINQ-EMU: it's newer, the docs already recommend it, and it has a singl
 
 - WINQ-EMU recommends **BIOS boot rather than EFI** for Vulkan/Venus performance. The script is UEFI-only.
 - `venus=true` is only added for Omarchy. Ubuntu 26.04's Mesa could likely use it too.
+
+### 8. First real run (user)
+
+- ? WINQ-EMU installed into `C:\WINQ-EMU`. GPU probe passed: `virtio-vga-gl,hostmem=4G,blob=true`, `sdl,gl=on`, WHPX, 0 warnings.
+- ? The launcher failed at once: `'hda-dup' is not a valid device model name`. The audio codec was misspelled in the launcher template; it should be `hda-duplex` (confirmed with `-device help`). Fixed.
+- Note: the files landed in `E:\Vms\` rather than `E:\VMs\Ubuntu26`. Check which `-VmDir` was actually passed.
+

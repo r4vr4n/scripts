@@ -534,7 +534,7 @@ param(
     '-rtc','base=utc'                                        # correct clock for Linux guests
 )
 if (@HAVEAUDIO@) {   # audio: DirectSound backend -> ICH9 HDA (PipeWire auto-detects in guest)
-    $a += @('-audiodev','dsound,id=ao','-device','ich9-intel-hda','-device','hda-dup,audiodev=ao')
+    $a += @('-audiodev','dsound,id=ao','-device','ich9-intel-hda','-device','hda-duplex,audiodev=ao')
 }
 if ($BootInstaller) {   # installer ISO with top boot priority while installing
     $a += @('-drive','file=@ISO@,if=none,id=cd,readonly=on','-device','ide-cd,drive=cd,bootindex=0')
